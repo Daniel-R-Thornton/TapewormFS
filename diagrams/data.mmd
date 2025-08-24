@@ -1,0 +1,19 @@
+graph TD
+ subgraph IO pipeline
+ direction RL
+  Usb_FUSE_server<-->esp32 --> encode/decode <-->dac/adc <--> pre_amp <--> Tape_Head <--> Tape 
+  end
+
+  subgraph encode
+    direction TB
+    File --> split_to_bytes --> build_symbol   
+  end
+
+  subgraph build_symbol
+    bytes --> bytes_to_re_fourier --> to_waveform --> build_ecc   
+  end
+
+subgraph to_waveform
+    generate_carriers --> combine_carriers 
+end
+
