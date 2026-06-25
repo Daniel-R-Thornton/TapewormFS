@@ -33,7 +33,7 @@ Store digital files on standard audio cassette tapes.
 |-------|------|------|
 | **host-driver** | Rust / C (FUSE) | Presents tape as sequential file system to OS |
 | **debug-suite** | TypeScript / Vite | Web-based waveform debugger & visualiser |
-| **firmware** | C / ESP-IDF / Pico SDK | Bit-level encode/decode: I2C (MCP4725) for output, I2S (PCM1808 / INMP441) for input |
+| **firmware** | C / ESP-IDF / Pico SDK | Bit-level encode/decode: I2C (MCP4725) for output, onboard ADC for input |
 | **filesystem** | Rust / C | Block allocation, error recovery, directory structure |
 
 ---
@@ -489,37 +489,35 @@ For a 200 baud modem with 1024 samples/frame, sample rate of ~8 kHz is sufficien
 
 **Output conditioning:** Place a 10 µF electrolytic + 100 nF ceramic capacitor between VOUT and GND to smooth the DAC output. A 1 kΩ resistor in series with the output limits current to the cassette deck's LINE IN.
 
-**ADC for read-back (I2S):** Cassette LINE OUT → input conditioning → I2S ADC → MCU.
+**ADC for read-back (on-board MCU ADC):** Cassette LINE OUT → voltage divider → MCU ADC pin.
 
-| ADC Chip | Bus | Bits | Sample Rate | Notes |
-|----------|-----|------|-------------|-------|
-| **PCM1808** | I2S | 24-bit | up to 96 kHz | Stereo, differential inputs, good SNR (99 dB). Primary choice. |
-| **INMP441** | I2S | 24-bit | up to 44.1 kHz | MEMS microphone — not line-level. Needs pre-amp mod. Avoid unless prototyping. |
-| ESP32 built-in ADC | — | 12-bit | ~6 kHz usable | Works for testing low baud rates only. Noisy. |
+The MCU's built-in ADC is used for audio capture. No external ADC chip required.
 
-**PCM1808 wiring:**
+| MCU | ADC Resolution | Usable Sample Rate | Notes |
+|-----|---------------|-------------------|-------|
+| **ESP32** | 12-bit (0–4095) | ~6–10 kHz | 2 ADCs, multiplexed across up to 18 pins. Attenuation set via `analogSetAttenuation()`. Non-linear near 0/Vref — use middle range. |
+| **RP2040** | 12-bit (0–4095) | ~500 kHz (single) / ~48 kHz (with DMA) | 4 inputs, 1 SAR ADC + mux. Much faster than ESP32 with proper DMA setup. |
 
-| PCM1808 Pin | Connect To |
-|-------------|------------|
-| VIN (1) | 3.3 V |
-| GND (2) | GND |
-| BCK (3) | MCU I2S bit clock (BCLK) |
-| DOUT (4) | MCU I2S data in (DIN) |
-| LRCK (5) | MCU I2S word select (LRCK/WS) |
-| SCKI (6) | GND (internal clock, no external needed) |
-| VREFL (7) | GND (analog ref low) |
-| VREFR (8) | GND |
-| VINL1+ (9) | Cassette LINE OUT (left channel, via DC-block cap) |
-| VINL1- (10) | GND |
-| VINR1+ (11) | Cassette LINE OUT (right channel, via DC-block cap) |
-| VINR1- (12) | GND |
-| FMT0 (13) | GND (I2S format) |
-| FMT1 (14) | GND |
+**Input conditioning circuit:**
 
-**Input conditioning** (between cassette LINE OUT and PCM1808):
-- 1 µF DC-blocking capacitor in series
-- 10 kΩ pulldown to GND after the cap
-- Optional: 100 Ω resistor + 100 pF cap as low-pass filter (~16 kHz cutoff)
+```
+Cassette LINE OUT  ──┬── 1µF DC-block ──┬── 10k┐── MCU ADC pin
+                     │                  │      │
+                    GND               GND    10k
+                                              │
+                                             GND
+```
+
+- **1 µF capacitor:** Blocks DC offset from cassette deck (typically 0.5–2 V)
+- **10 kΩ pulldown:** Biases the ADC input to GND after DC block
+- **Optional 10 kΩ to GND:** Forms a voltage divider for hot cassette outputs (>3.3 V peak). Omit if cassette output is ≤3.3 V.
+- **3.3 V zener diode** (optional): Clamp protection across ADC pin to GND.
+
+**ESP32 specific notes:**
+- Use `analogSetAttenuation(ADC_11db)` to widen input range to ~0–3.3 V
+- ADC2 is used by WiFi — use ADC1 for reliable capture
+- Two consecutive reads and discard the first to stabilise the sample
+- Built-in ADC is noisy (±2–3% jitter). For 200 baud / 1024-sample frames, this is manageable — the modem decoder already expects noise
 
 ---
 
@@ -680,7 +678,7 @@ A simple TCP server (port 9725) that speaks a text protocol for systems that can
 
 ### Phase 4 — Firmware (ESP32)
 - [ ] I2C output to MCP4725 DAC (audio generation via timer ISR)
-- [ ] I2S input from PCM1808 ADC (audio capture from cassette LINE OUT)
+- [ ] ADC input from onboard MCU ADC (audio capture from cassette LINE OUT)
 - [ ] Real-time encode (Basic / FrequencyPulse)
 - [ ] Real-time decode (sync detection, frame correlation)
 - [ ] Motor control (relay / MOSFET)
