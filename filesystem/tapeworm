@@ -255,12 +255,11 @@ def cmd_mount(mountpoint):
             if not e: d.remove(path.lstrip('/')); fs.write_directory(d)
             return 0
 
-    # ---- Start FUSE in background + keep running ------------- #
+    # ---- Start FUSE in background ----------------------------- #
     try:
         os.makedirs(mountpoint, exist_ok=True)
         abspath = os.path.abspath(mountpoint)
         print(f"  Mounted at {abspath}")
-        print(f"  cat {abspath}/_tape_status.txt  to see status")
         
         def run_fuse():
             try:
@@ -270,9 +269,88 @@ def cmd_mount(mountpoint):
         threading.Thread(target=run_fuse, daemon=True).start()
         time.sleep(0.5)
         
-        # Keep alive until Ctrl+C
-        while True:
-            time.sleep(1)
+        # ---- tkinter debug window ------------------------------- #
+        import tkinter as tk
+        root = tk.Tk()
+        root.title("TapewormFS — Live Debug")
+        root.geometry("900x600")
+        root.configure(bg='#1a1a2e')
+        root.attributes("-topmost", True)
+        
+        BG = '#1a1a2e'; FG = '#e0e0e0'; ACCENT = '#00d4aa'
+        WAVE_BG = '#16213e'
+        
+        # Waveform canvas
+        wave_canvas = tk.Canvas(root, bg=WAVE_BG, height=200, highlightthickness=0)
+        wave_canvas.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        
+        # Tape position bar
+        tape_canvas = tk.Canvas(root, bg='#0f3460', height=30, highlightthickness=0)
+        tape_canvas.pack(fill=tk.X, padx=10, pady=2)
+        
+        # Info row
+        info = tk.Frame(root, bg=BG)
+        info.pack(fill=tk.X, padx=10, pady=5)
+        motor_lbl = tk.Label(info, text="MOTOR: ■ STOPPED", fg='#ff6b6b', bg=BG, font=('Consolas',11))
+        motor_lbl.pack(side=tk.LEFT, padx=10)
+        pkt_lbl = tk.Label(info, text="PACKETS: 0", fg=FG, bg=BG, font=('Consolas',11))
+        pkt_lbl.pack(side=tk.LEFT, padx=10)
+        pos_lbl = tk.Label(info, text="POS: 0 mm", fg=FG, bg=BG, font=('Consolas',11))
+        pos_lbl.pack(side=tk.RIGHT, padx=10)
+        
+        # Waveform reader
+        def read_wave():
+            if os.path.exists("/tmp/tapewormfs_raw.tape"):
+                with open("/tmp/tapewormfs_raw.tape",'rb') as f:
+                    f.seek(-320*4,2)
+                    raw = f.read(320*4)
+                return [__import__('struct').unpack_from('<f',raw,i)[0] for i in range(0,len(raw),4)]
+            return []
+        
+        def redraw():
+            cw = wave_canvas.winfo_width() or 800
+            ch = wave_canvas.winfo_height() or 200
+            wave_canvas.delete('all')
+            mid = ch/2
+            for y in range(0,ch,20):
+                wave_canvas.create_line(0,y,cw,y,fill='#1a3a5c',width=1)
+            wave_canvas.create_line(0,mid,cw,mid,fill='#2a4a6c',width=1)
+            
+            samples = read_wave()
+            if len(samples)>1:
+                step = max(1, len(samples)//cw)
+                pts = []
+                for x in range(cw):
+                    idx = min(x*step, len(samples)-1)
+                    y = mid - samples[idx]*(ch/2-5)
+                    pts.extend([x, max(0,min(ch-1,y))])
+                if pts: wave_canvas.create_line(*pts, fill=ACCENT, width=2, smooth=True)
+            
+            # Tape bar
+            tw = tape_canvas.winfo_width() or 800
+            tape_canvas.delete('all')
+            try:
+                sz = os.path.getsize("/tmp/tapewormfs_raw.tape")
+                pos_mm = sz/4/(3200/47.6) if sz else 0
+                frac = min(1.0, pos_mm/90000)
+                hx = int(frac*(tw-10))+5
+                tape_canvas.create_line(5,15,tw-5,15,fill='#333',width=6)
+                tape_canvas.create_line(5,15,hx,15,fill=ACCENT,width=6)
+                tape_canvas.create_rectangle(hx-4,8,hx+4,22,fill='#ff6b6b',outline='')
+                pos_lbl.config(text=f"POS: {pos_mm:.0f} mm")
+            except: pass
+            
+            # Motor state
+            pkt_lbl.config(text=f"PACKETS: {status['text']}")
+            motor_states = ["■ STOPPED", "▶▶ FAST", "▶ PLAY", "◀◀ REW"]
+            ms = motor_states[int(time.time())%4]
+            motor_lbl.config(text=f"MOTOR: {ms}")
+            
+            root.after(100, redraw)
+        
+        root.after(100, redraw)
+        root.mainloop()
+        
     except KeyboardInterrupt:
         pass
     except Exception as e:
