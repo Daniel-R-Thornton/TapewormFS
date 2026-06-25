@@ -1,7 +1,8 @@
 # TapewormFS — Architecture Summary
 
-Concept: store digital files on audio cassette. The ESP32-S3 presents as a
-USB flash drive; an SD card provides instant I/O; tape syncs in background.
+Store files on audio cassette. The host PC runs a driver that mounts a
+folder (e.g. `/mnt/tape`) backed by the cassette. The ESP32 handles only
+modem encoding/decoding over UART.
 
 ---
 
@@ -9,38 +10,36 @@ USB flash drive; an SD card provides instant I/O; tape syncs in background.
 
 ```mermaid
 flowchart TB
-    subgraph User[" "]
-        D["D:\ (USB MSC)"]
+    subgraph Host["Host Computer"]
+        MOUNT["/mnt/tape0 (FUSE/WinFSP)<br/>looks like a normal folder"]
+        CACHE["/tmp/tapewormfs/<br/>disk-backed cache"]
+        FS["tapefs::Filesystem"]
+        DRIVER["Host Driver<br/>(background sync thread)"]
+        PROTO["Packet Protocol<br/>[0xFE | len | cmd | payload | crc16]"]
     end
 
-    subgraph ESP32["ESP32-S3 Firmware"]
-        USB["USB Mass Storage<br/>(TinyUSB)"]
-        SD["SD Card Cache<br/>(FAT32)"]
-        FS["Filesystem Layer<br/>(format, write, read)"]
-        SYNC["Background Sync<br/>(tape ↔ SD)"]
-        MODEM["Modem<br/>(FSK + Pilot)"]
-        PROTO["Packet Protocol<br/>[0xFE | len | cmd | payload | crc16]"]
-
-        USB <--> SD
-        SD <--> FS
-        FS <--> SYNC
-        SYNC <--> MODEM
-        MODEM <--> PROTO
+    subgraph ESP32["ESP32 (any model)"]
+        UART["UART command handler"]
+        MODEM["FSK Modem + Pilot"]
+        DAC["MCP4725 (I2C) → cassette LINE IN"]
+        ADC["Onboard ADC ← cassette LINE OUT"]
     end
 
     subgraph Tape["Cassette Deck"]
-        DAC["MCP4725 DAC<br/>(I2C)"]
-        ADC["Onboard ADC"]
-        TAPE["Audio Cassette"]
-        DAC --> TAPE
-        TAPE --> ADC
+        MEDIA["Audio Cassette"]
     end
 
-    User <-- USB --> USB
-    PROTO <-- UART --> DAC
-    ADC <-- UART --> PROTO
+    User["User copies files<br/>to /mnt/tape0"] --> MOUNT
+    MOUNT <--> CACHE
+    CACHE <--> FS
+    FS <--> DRIVER
+    DRIVER <--> PROTO
+    PROTO <-- UART --> UART
+    UART --> MODEM
+    MODEM --> DAC --> MEDIA
+    MEDIA --> ADC --> MODEM
 
-    style User fill:#e1f5fe
+    style Host fill:#e3f2fd
     style ESP32 fill:#f3e5f5
     style Tape fill:#fff3e0
 ```
@@ -50,46 +49,44 @@ flowchart TB
 ```mermaid
 sequenceDiagram
     participant User as User App
-    participant Cache as SD Cache
+    participant Cache as /tmp cache
     participant FS as Filesystem
-    participant Modem as FSK Modem
+    participant Proto as Packet Protocol
+    participant ESP as ESP32
     participant Tape as Cassette
 
-    Note over User,Tape: Write Path
-    User->>Cache: Save file (instant)
-    User->>FS: write_file("doc.txt")
+    Note over User,Tape: Write file to /mnt/tape0/doc.txt
+    User->>Cache: write(file, data)  (instant)
+    Cache-->>FS: mark file as dirty
+
+    Note over FS,Tape: Background sync (seconds later)
     FS->>FS: split into blocks
     FS->>FS: add RS parity + CRC
-    FS->>Modem: encode blocks to audio
-    Modem->>Tape: output via MCP4725
-    
-    Note over User,Tape: Read Path
-    Tape->>Modem: audio input via ADC
-    Modem->>Modem: decode FSK tones
-    Modem->>FS: raw blocks
-    FS->>FS: verify CRC, correct RS
-    FS->>FS: reassemble file
-    FS->>Cache: cache for next time
+    FS->>Proto: WRITE_BLOCK + FLUSH
+    Proto->>ESP: [0xFE|len|0x05|payload|crc16]
+    ESP->>ESP: FSK encode → audio samples
+    ESP->>Tape: output via MCP4725
+
+    Note over User,Tape: Read file from /mnt/tape0/doc.txt
+    Cache-->>FS: cache miss
+    FS->>Proto: SEEK + READ_NEXT
+    Proto->>ESP: [0xFE|len|0x06|crc16]
+    ESP->>ESP: decode audio ← ADC
+    ESP-->>Proto: raw block back
+    FS->>FS: verify CRC, reassemble
+    FS->>Cache: cache file
     Cache->>User: return data
-    
-    Note over User,Tape: Background Sync
-    Cache-->>FS: dirty file detected
-    FS-->>Modem: encode to audio
-    Modem-->>Tape: write to cassette
 ```
 
-## Performance
+## Sync Strategy
 
-| Metric | Target |
-|--------|--------|
-| Raw bit rate | 200 baud |
-| Net throughput | ~100 B/s (after FEC) |
-| C60 capacity | ~180 KB/side |
-| USB interface | 12 Mbps (USB 1.1) |
-| SD card speed | ~4 MB/s (SPI) |
-| Block read from tape | ~10 s |
-| File open (cached) | <10 ms |
-| File open (uncached) | 30–60 s |
+| Trigger | Action |
+|---------|--------|
+| User saves file to mount | Write to /tmp cache instantly |
+| 10s of no I/O | Start background write to tape |
+| User reads uncached file | Read from tape (slow), cache result |
+| File already cached | Serve from /tmp instantly |
+| Eject / unmount | Force-sync all dirty files to tape |
 
 ## Project Layout
 
@@ -97,24 +94,23 @@ sequenceDiagram
 TapewormFS/
 ├── filesystem/
 │   ├── tapefs.py              ← Python FS lib (for tests)
-│   ├── dummy_mcu.py           ← ESP32 simulator (stdio mode)
+│   ├── dummy_mcu.py           ← ESP32 simulator
+│   ├── host_driver.py         ← Mounts a folder backed by tape
 │   ├── test_tapefs.py         ← Unit tests (6 pass)
 │   ├── test_integration.py    ← Integration tests (5 pass)
 │   └── cpp/                   ← C++17 production code
 │       ├── CMakeLists.txt
-│       ├── include/tapefs/    ← Headers (7 files)
-│       ├── src/               ← Implementation (6 files)
+│       ├── include/tapefs/    ← Headers
+│       ├── src/               └── Implementation
 │       └── tests/             ← C++ unit tests (6 pass)
 ├── SPEC.md                    ← Full spec
-├── OFDM_PHY.md                ← Physical layer spec
-├── CPP_STYLE.md               ← C++ style guide
-└── debug-suite/               ← Web modem visualiser
+└── OFDM_PHY.md                ← Physical layer spec
 ```
 
 Run tests:
 ```bash
 cd filesystem
-python3 test_tapefs.py         # unit tests
-python3 test_integration.py    # integration tests
+python3 test_tapefs.py
+python3 test_integration.py
 cd cpp/build && cmake .. && make && ./test_tapefs
 ```

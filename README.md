@@ -1,62 +1,72 @@
 # TapewormFS
 
-Store digital files on audio cassette tapes.
+Store files on audio cassette. Mount a folder, copy files — the driver
+handles everything: caching, sync, the UART protocol to the ESP32 modem.
 
-```mermaid
-flowchart TB
-    subgraph Host["Host Computer"]
-        D["D:\ (USB Mass Storage)"]
-        SD["SD Card Cache (FAT32)"]
-        FS["tapefs::Filesystem"]
-    end
+## Quick start
 
-    subgraph MCU["ESP32-S3 Firmware"]
-        MSC["USB MSC (TinyUSB)"]
-        PROTO["Packet Protocol<br/>[0xFE|len|cmd|payload|crc16]"]
-        SYNC["Background Tape Sync"]
-    end
+```bash
+# List files on tape (over UART)
+python3 host_driver.py ls --port /dev/ttyUSB0
 
-    subgraph Tape["Cassette Deck"]
-        DAC["MCP4725 (I2C) → output"]
-        ADC["Onboard ADC → input"]
-    end
+# Mount tape as a folder (FUSE)
+pip install fusepy
+python3 host_driver.py mount ./tape_mount --port /dev/ttyUSB0
 
-    D <-- USB --> MSC
-    MSC <--> SD
-    SD <--> FS
-    FS <--> PROTO
-    PROTO <-- UART --> SYNC
-    SYNC --> DAC
-    ADC --> SYNC
+# Sync a local folder to/from tape
+python3 host_driver.py sync ./my_backup --port /dev/ttyUSB0
 
-    style Host fill:#e3f2fd
-    style MCU fill:#f3e5f5
-    style Tape fill:#fff3e0
+# Format tape
+python3 host_driver.py format --port /dev/ttyUSB0
+
+# Without hardware: test with DummyMCU
+python3 host_driver.py ls --port stdio    # reads from stdin
 ```
 
-## Project layout
+## Architecture
+
+```mermaid
+flowchart LR
+    subgraph Computer["Host Computer"]
+        MOUNT["/mnt/tape0 (FUSE)"]
+        CACHE["/tmp/tapewormfs cache"]
+        DRIVER["host_driver.py"]
+    end
+
+    subgraph ESP["ESP32"]
+        UART["UART handler"]
+        MODEM["FSK Modem"]
+        DAC["MCP4725 DAC"]
+    end
+
+    TAPE["Audio Cassette"]
+
+    User["Copy files here"] --> MOUNT
+    MOUNT <--> CACHE
+    CACHE <--> DRIVER
+    DRIVER <-- UART --> UART
+    UART --> MODEM --> DAC --> TAPE
+    TAPE --> MODEM
+```
+
+The ESP32 has no filesystem, no SD card, no USB mass storage.
+It just encodes/decodes audio frames over serial. The host does
+all the heavy lifting: filesystem, caching, presenting as a drive.
+
+## Project
 
 | Path | What |
 |------|------|
-| `filesystem/cpp/` | C++17 production code (6 classes, 6 tests) |
-| `filesystem/tapefs.py` | Python FS lib (for tests) |
-| `filesystem/dummy_mcu.py` | ESP32 simulator with tape physics |
-| `filesystem/test_tapefs.py` | Unit tests (6 pass) |
-| `filesystem/test_integration.py` | Serial integration tests (5 pass) |
-| `debug-suite/` | Web modem visualiser (TypeScript) |
-| `SPEC.md` | Full protocol & filesystem spec |
-| `OFDM_PHY.md` | Physical layer spec (FSK+pilot) |
-| `ARCHITECTURE.md` | System architecture |
+| `host_driver.py` | Mounts a folder backed by tape |
+| `tapefs.py` | Filesystem library (CRC, RS ECC, Directory, Block) |
+| `dummy_mcu.py` | ESP32 simulator for testing |
+| `cpp/` | C++17 implementation of the same filesystem |
 
-## Build & test
+## Tests
 
 ```bash
-# C++ (production)
-cd filesystem/cpp && mkdir build && cd build
-cmake .. && make && ./test_tapefs
-
-# Python (tests)
 cd filesystem
-python3 test_tapefs.py
-python3 test_integration.py
+python3 test_tapefs.py         # 6 unit tests
+python3 test_integration.py    # 5 integration tests
+cd cpp/build && cmake .. && make && ./test_tapefs   # 6 C++ tests
 ```
