@@ -8,9 +8,19 @@
 
 ## Physical Layer: Hybrid FSK + Pilot Tone
 
+```mermaid
+block-beta
+columns 8
+    Pilot["Pilot<br/>62.5 Hz"] FSK1["Tone 1<br/>400Hz"] FSK2["Tone 2<br/>600Hz"] FSK3["Tone 3<br/>800Hz"] FSK4["Tone 4<br/>1000Hz"] FSK5["Tone 5<br/>1150Hz"] FSK6["Tone 6<br/>1300Hz"] FSK7["Tone 7<br/>1450Hz"]
+    space
+    Columns 8
+    Pilot2["Pilot (continuous)"] gap1:1 Tones["FSK tones (one at a time)"]:6 Guard["Guard<br/>2ms"]
+end
+```
+
 **Primary modulation:** Multi‑tone FSK (original FrequencyPulse)
-- 4–16 tones, 100–200 symbols/s → 200–1600 bps raw
-- Simple to decode: Goertzel filter bank or zero‑crossing discriminator
+- 8 tones, 50 symbols/s → 400 bps raw
+- Simple to decode: correlation against sine/cosine references
 - Proven in `debug-suite/`, easy to port to ESP32 C
 
 **Continuous pilot tone:** 62.5 Hz sine/square, placed below the FSK band
@@ -23,6 +33,22 @@
 ---
 
 ## Tape Layout & Mirroring
+
+```mermaid
+flowchart LR
+    subgraph SideA["Side A"]
+        direction LR
+        Start["BOT"] --> F1["Block 0<br/>(copy)"] --> F2["Block 1<br/>(copy)"] --> Mid["Directory<br/>(superblock)"]
+        End["EOT"] --> R2["Block 1<br/>(copy)"] --> R1["Block 0<br/>(copy)"] --> Mid
+    end
+
+    Start -- "Forward (15 min)" --> Mid
+    End -- "Reverse (15 min)" --> Mid
+
+    style Start fill:#c8e6c9
+    style End fill:#ffcdd2
+    style Mid fill:#bbdefb
+```
 
 - Side A split into **Forward** (beginning → middle) and **Reverse** (end → middle), both containing identical data
 - **Directory superblock** resides in the middle

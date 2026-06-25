@@ -120,10 +120,55 @@ No raw function pointers. No polling loops.
 
 ## 11. TapewormFS project patterns
 
-- **Protocol:** `Packet` struct with `pack()` / `unpack()` methods
-- **State machine:** enum class states + event table
-- **Filesystem:** `Block` and `Directory` classes that serialise/deserialise to/from byte arrays
-- **Modem:** `ModemEncoder` / `ModemDecoder` with Config structs, read samples from callbacks, emit decoded data via callbacks
+```mermaid
+classDiagram
+    class Types {
+        +BlockType
+        +Status
+        +Result~T~
+        +BlockNumber
+        +WriteCallback
+        +ReadCallback
+        +SeekCallback
+    }
+    class Crc32 {
+        +compute(data) uint32_t
+    }
+    class Ecc {
+        +encode(data) Parity
+        +decode(data, parity) Status
+    }
+    class Directory {
+        +add(filename, size, start, end) Result
+        +find(filename) DirEntry
+        +serialise() ByteBuffer
+        +deserialise(data) Directory
+    }
+    class Block {
+        +type: BlockType
+        +seqNo: BlockNumber
+        +data: ByteBuffer
+    }
+    class Filesystem {
+        +format() Status
+        +readDirectory() Result~Directory~
+        +writeFile(filename, data) Status
+        +readFile(filename) Result~ByteBuffer~
+    }
+    class DummyMcu {
+        +rawWrite(block) bool
+        +rawRead() ByteBuffer
+        +rawSeek(blockNo) bool
+        +tapeSize() size_t
+    }
+    
+    Filesystem --> Types : uses callbacks
+    Filesystem --> Directory
+    Filesystem --> Block
+    Block --> Crc32
+    Block --> Ecc
+    Directory --> Types
+```
 
 ---
 

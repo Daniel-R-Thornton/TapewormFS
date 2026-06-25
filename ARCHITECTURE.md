@@ -1,115 +1,120 @@
 # TapewormFS — Architecture Summary
 
-## Concept
-Store digital files on audio cassette tapes. The ESP32 emulates a USB flash drive so Windows/macOS sees it as a normal drive (`D:\`). Behind the scenes, files are actually encoded as audio and stored on cassette.
+Concept: store digital files on audio cassette. The ESP32-S3 presents as a
+USB flash drive; an SD card provides instant I/O; tape syncs in background.
 
-## Hardware
+---
 
-### Output path (write to tape)
-```
-ESP32 → I2C (MCP4725 12-bit DAC) → 3.5mm jack → cassette LINE IN
-```
+## System Architecture
 
-### Input path (read from tape)
-```
-Cassette LINE OUT → voltage divider + DC-block cap → ESP32 onboard ADC
-```
+```mermaid
+flowchart TB
+    subgraph User[" "]
+        D["D:\ (USB MSC)"]
+    end
 
-## Software Architecture
+    subgraph ESP32["ESP32-S3 Firmware"]
+        USB["USB Mass Storage<br/>(TinyUSB)"]
+        SD["SD Card Cache<br/>(FAT32)"]
+        FS["Filesystem Layer<br/>(format, write, read)"]
+        SYNC["Background Sync<br/>(tape ↔ SD)"]
+        MODEM["Modem<br/>(FSK + Pilot)"]
+        PROTO["Packet Protocol<br/>[0xFE | len | cmd | payload | crc16]"]
 
-```
-┌──────────────────────────────────────────────────┐
-│  User sees: D:\  (USB Mass Storage Class)        │
-│  └── file.txt  (instant read/write)              │
-│                                                   │
-│  USB MSC via TinyUSB on ESP32-S3                 │
-│  (12 Mbps USB 1.1, no drivers needed)            │
-├──────────────────────────────────────────────────┤
-│  SD Card Cache (FAT32)                           │
-│  └── files/           ← what user sees           │
-│  └── .tapecache/      ← sync metadata            │
-│                                                   │
-│  Reads/writes to SD happen instantly via SPI      │
-│  (~4 MB/s at 40 MHz)                             │
-├──────────────────────────────────────────────────┤
-│  Background Tape Sync (dual-core)                 │
-│  1. "Dirty" files on SD → encode → write to tape │
-│  2. New blocks on tape → decode → copy to SD     │
-│  3. Idle detection: syncs after 10s of no I/O    │
-├──────────────────────────────────────────────────┤
-│  Modem Layer (audio encode/decode)               │
-│  └── BasicEncoder: phase-shift keying (~200 baud)│
-│  └── FrequencyPulse: multi-tone FSK (~100 baud)  │
-│  └── Both defined in debug-suite/ (TypeScript)   │
-├──────────────────────────────────────────────────┤
-│  Protocol Layer (host ↔ MCU)                     │
-│  └── Framed binary packets over USB CDC:         │
-│      [0xFE | len | cmd_id | payload | crc16]     │
-│  └── Commands: WRITE_BLOCK, READ_NEXT, SEEK,     │
-│      FLUSH, STOP, PING, GET_STATUS, SET_CONFIG   │
-│  └── Byte escaping (0xFE→FD 01, FD→FD 02)       │
-├──────────────────────────────────────────────────┤
-│  Filesystem Layer (Python, on host for now)      │
-│  └── tapefs.py: Directory, Block, RS(255,239),   │
-│      CRC-32, Filesystem API                      │
-│  └── dummy_mcu.py: Simulated ESP32 for testing   │
-│  └── serial_transport.py: Real UART transport    │
-│  └── All pure Python, no deps besides pyserial   │
-└──────────────────────────────────────────────────┘
+        USB <--> SD
+        SD <--> FS
+        FS <--> SYNC
+        SYNC <--> MODEM
+        MODEM <--> PROTO
+    end
+
+    subgraph Tape["Cassette Deck"]
+        DAC["MCP4725 DAC<br/>(I2C)"]
+        ADC["Onboard ADC"]
+        TAPE["Audio Cassette"]
+        DAC --> TAPE
+        TAPE --> ADC
+    end
+
+    User <-- USB --> USB
+    PROTO <-- UART --> DAC
+    ADC <-- UART --> PROTO
+
+    style User fill:#e1f5fe
+    style ESP32 fill:#f3e5f5
+    style Tape fill:#fff3e0
 ```
 
-## Key Design Decisions
+## Data Flow
 
-### Why not direct USB MSC with no SD card?
-Tape is too slow (~25 B/s). Windows Explorer would time out on every directory listing. The SD card is the fast cache; tape is the long-term archive.
+```mermaid
+sequenceDiagram
+    participant User as User App
+    participant Cache as SD Cache
+    participant FS as Filesystem
+    participant Modem as FSK Modem
+    participant Tape as Cassette
 
-### Why ESP32-S3 (not basic ESP32)?
-Needs native USB OTG for USB Mass Storage. ESP32-S2/S3 have it. Regular ESP32 doesn't — you'd need a separate USB bridge chip.
+    Note over User,Tape: Write Path
+    User->>Cache: Save file (instant)
+    User->>FS: write_file("doc.txt")
+    FS->>FS: split into blocks
+    FS->>FS: add RS parity + CRC
+    FS->>Modem: encode blocks to audio
+    Modem->>Tape: output via MCP4725
+    
+    Note over User,Tape: Read Path
+    Tape->>Modem: audio input via ADC
+    Modem->>Modem: decode FSK tones
+    Modem->>FS: raw blocks
+    FS->>FS: verify CRC, correct RS
+    FS->>FS: reassemble file
+    FS->>Cache: cache for next time
+    Cache->>User: return data
+    
+    Note over User,Tape: Background Sync
+    Cache-->>FS: dirty file detected
+    FS-->>Modem: encode to audio
+    Modem-->>Tape: write to cassette
+```
 
-### Sync strategy
-| Trigger | Action | Why |
-|---------|--------|-----|
-| User saves file | Write to SD instantly | Don't make user wait |
-| 10s of no I/O | Start tape write | Background sync |
-| User clicks "Eject" | Force-sync remaining, then safe-eject | Prevent data loss |
-| Fresh tape inserted | Full tape scan → build SD cache | One-time wait (~30 min for C60) |
+## Performance
 
-### RS(255,239) error correction
-- Every 1024-byte block gets 16 parity bytes
-- Corrects up to 8 corrupted bytes per block
-- Encode + no-error decode works; error correction still being debugged
-- CRC-32 wraps everything for integrity verification
-
-### Performance targets
 | Metric | Target |
 |--------|--------|
-| Raw bit rate on tape | 200 baud |
-| Usable data rate | ~80 B/s (after ECC + framing) |
-| C60 cassette capacity | ~180 KB/side |
-| USB interface speed | 12 Mbps (USB 1.1, limited by ESP32) |
-| SD card speed | ~4 MB/s (SPI at 40 MHz) |
-| Block read time from tape | ~10 s |
-| File open latency (cached) | <10 ms |
-| File open latency (uncached) | 30–60 s (rewind + read dir) |
+| Raw bit rate | 200 baud |
+| Net throughput | ~100 B/s (after FEC) |
+| C60 capacity | ~180 KB/side |
+| USB interface | 12 Mbps (USB 1.1) |
+| SD card speed | ~4 MB/s (SPI) |
+| Block read from tape | ~10 s |
+| File open (cached) | <10 ms |
+| File open (uncached) | 30–60 s |
 
-## Code Status
+## Project Layout
 
-### Done
-- `filesystem/tapefs.py` — full filesystem: CRC, RS encode/decode, Directory, Block serialisation, Filesystem API
-- `filesystem/dummy_mcu.py` — simulated ESP32 with packet protocol, state machine, TCP server, error injection
-- `filesystem/serial_transport.py` — real UART transport for pyserial
-- `filesystem/test_tapefs.py` — 6 tests, all passing
-- `debug-suite/` — web-based modem debugger (TypeScript/Vite)
+```
+TapewormFS/
+├── filesystem/
+│   ├── tapefs.py              ← Python FS lib (for tests)
+│   ├── dummy_mcu.py           ← ESP32 simulator (stdio mode)
+│   ├── test_tapefs.py         ← Unit tests (6 pass)
+│   ├── test_integration.py    ← Integration tests (5 pass)
+│   └── cpp/                   ← C++17 production code
+│       ├── CMakeLists.txt
+│       ├── include/tapefs/    ← Headers (7 files)
+│       ├── src/               ← Implementation (6 files)
+│       └── tests/             ← C++ unit tests (6 pass)
+├── SPEC.md                    ← Full spec
+├── OFDM_PHY.md                ← Physical layer spec
+├── CPP_STYLE.md               ← C++ style guide
+└── debug-suite/               ← Web modem visualiser
+```
 
-### To Do
-- USB MSC firmware on ESP32-S3 (TinyUSB + SD card + dual-core sync)
-- Port modem from TypeScript → C for firmware
-- USB CDC command handler (listen for WRITE_BLOCK/READ_NEXT etc.)
-- Eject / force-sync UX (LED, button)
-- First-tape-scan progress indicator
-
-## How to run tests
+Run tests:
 ```bash
 cd filesystem
-python3 test_tapefs.py
+python3 test_tapefs.py         # unit tests
+python3 test_integration.py    # integration tests
+cd cpp/build && cmake .. && make && ./test_tapefs
 ```

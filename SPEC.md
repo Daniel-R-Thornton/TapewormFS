@@ -36,6 +36,7 @@ Store digital files on standard audio cassette tapes.
 | **firmware** | C / ESP-IDF / Pico SDK | Bit-level encode/decode: I2C (MCP4725) for output, onboard ADC for input |
 | **filesystem** | Rust / C | Block allocation, error recovery, directory structure |
 
+
 ---
 
 ## 2. Data Flow
@@ -62,6 +63,32 @@ Cassette LINE OUT → firmware (I2S ADC) → modem decode
   filesystem layer → ECC recovery → reassemble
       ↓
   /tmp buffer → host-driver → OS
+```
+
+### 2.3 Packet Protocol (wire format)
+
+```mermaid
+packet-beta
+0-7: "0xFE"
+8-15: "Length"
+16-23: "Cmd ID"
+24-47: "Payload (0-65535 B)"
+48-55: "CRC-16"
+```
+
+```mermaid
+sequenceDiagram
+    participant Host as Host Driver
+    participant MCU as ESP32
+
+    Host->>MCU: [0xFE | len | 0x05=WRITE | payload | crc16]
+    MCU-->>Host: [0xFE | len | 0x85=ACK | 0x00 | crc16]
+
+    Host->>MCU: [0xFE | len | 0x07=FLUSH | crc16]
+    MCU-->>Host: [0xFE | len | 0x87=ACK | 0x00 | crc16]
+
+    Host->>MCU: [0xFE | len | 0x06=READ | crc16]
+    MCU-->>Host: [0xFE | len | 0x86 | type+data+crc32 | crc16]
 ```
 
 ---
@@ -99,6 +126,24 @@ Both layers carry the same packet format (§3.2). The protocol is symmetric — 
 **Response convention:** Response ID = Request ID | `0x80`. Every request gets exactly one response (ACK/NAK). NAK carries a 1-byte error code.
 
 ### 3.3 MCU State Machine
+
+```mermaid
+stateDiagram-v2
+    [*] --> IDLE
+    IDLE --> SEEK: SEEK command
+    IDLE --> REWIND: REWIND command
+    IDLE --> READ: READ_NEXT (first)
+    IDLE --> WRITE: WRITE_BLOCK (first)
+    IDLE --> STREAM: STREAM_READ / STREAM_WRITE
+    SEEK --> IDLE: arrived
+    REWIND --> IDLE: at BOT
+    READ --> IDLE: STOP
+    WRITE --> IDLE: FLUSH
+    STREAM --> IDLE: STOP
+    IDLE --> ERROR: hardware fault
+    SEEK --> ERROR: hardware fault
+    ERROR --> IDLE: STOP
+```
 
 The MCU runs a deterministic state machine. Certain commands are only valid in certain states.
 
@@ -441,11 +486,14 @@ Both defined in `debug-suite/src/core/processors/`.
 
 ### 4.2 Cassette Tape Layout
 
-```
-┌─────────────────────────────────────────────────────┐
-│ Leader │  Sync  │ Block 1 │ Block 2 │ ... │ Trailer │
-│ (5s)   │ (512B) │ (<=1KB) │ (<=1KB) │     │ (5s)    │
-└─────────────────────────────────────────────────────┘
+```mermaid
+block-beta
+columns 5
+    Leader["Leader<br/>5s"] Sync["Sync<br/>512B"] Block1["Block 1<br/><=1KB"] Block2["Block 2<br/><=1KB"] Trailer["Trailer<br/>5s"]
+    space
+    Columns 2
+    Gap["Inter-block gap<br/>>=500ms"]
+end
 ```
 
 - **Leader:** Unmodulated carrier / silence for AGC stabilisation
@@ -525,25 +573,21 @@ Cassette LINE OUT  ──┬── 1µF DC-block ──┬── 10k┐── MC
 
 ### 5.1 Block Structure
 
+```mermaid
+block-beta
+columns 6
+    Type["Type<br/>1B"] Seq["Seq No<br/>4B"] Payload["Payload<br/><=1000B"] ECC["RS Parity<br/>16B"] CRC["CRC-32<br/>4B"]
+```
+
 Each physical block on tape (≤1024 bytes after modem encode):
 
-```
-┌────┬──────────┬──────────┬──────────────┬────────┐
-│  B │  seq_no  │  payload │  ECC (Reed-  │ CRC-32 │
-│  E │  (4B)    │  (≤1000B)│  Solomon)    │  (4B)   │
-│  A │          │          │  (≤16B)      │        │
-│  D │          │          │              │        │
-│  E │          │          │              │        │
-│  R │          │          │              │        │
-└────┴──────────┴──────────┴──────────────┴────────┘
-```
-
-**Prefix byte** — block type:
-- `0x01` = data block
-- `0x02` = directory block
-- `0x03` = FAT block (file allocation table)
-- `0x04` = ECC / parity block
-- `0xFF` = end-of-tape marker
+| Field | Size | Description |
+|-------|------|-------------|
+| Type | 1 B | Block type (0x01=data, 0x02=dir, 0x03=FAT, 0xFF=EOT) |
+| Seq No | 4 B | Sequential block number (little-endian) |
+| Payload | ≤1000 B | File data or directory entries |
+| RS Parity | 16 B | Reed-Solomon RS(255,239) parity |
+| CRC-32 | 4 B | Integrity check over everything above |
 
 ### 5.2 Directory
 
