@@ -186,11 +186,14 @@ def cmd_write(local, tapename=None):
 
 def cmd_mount(mountpoint):
     """Mount FUSE folder + show live GUI debug window."""
+    fuse_available = False
     try:
         import fuse
+        fuse_available = True
     except ImportError:
-        print("Need fusepy: pip install fusepy")
-        return
+        print("  Note: fusepy not installed. Filesystem operations disabled.")
+        print("  Install with: pip install fusepy")
+        print("  The debug UI will still show.")
 
     fw_start()
     from tapefs import Filesystem, RawBlock
@@ -201,6 +204,8 @@ def cmd_mount(mountpoint):
     from tkinter import ttk
 
     root = tk.Tk()
+    root.attributes("-topmost", True)
+    root.lift()
     root.title("TapewormFS — Live Debug")
     root.geometry("900x600")
     root.configure(bg='#1a1a2e')
@@ -371,55 +376,60 @@ def cmd_mount(mountpoint):
     root.protocol("WM_DELETE_WINDOW", on_close)
 
     # ---- Start FUSE in background thread ------------------------- #
-    class TapeFS(fuse.Operations):
-        def getattr(self, path, fh=None):
-            st = fuse.Stat()
-            st.st_mode = 0o755; st.st_nlink = 2
-            if path == '/': st.st_mode = 0o755 | 0o40000; return st
-            name = path.lstrip('/')
-            from tapefs import Directory
-            d, e = fs.list_files()
-            if e: return -fuse.ENOENT
-            for x in d.entries:
-                if x.filename == name:
-                    st.st_mode = 0o644 | 0o100000; st.st_nlink = 1
-                    st.st_size = x.file_size; return st
-            return -fuse.ENOENT
-        def readdir(self, path, fh):
-            yield '.'; yield '..'
-            from tapefs import Directory
-            d, e = fs.list_files()
-            if not e:
-                for x in d.entries: yield x.filename
-        def open(self, path, flags): return 0
-        def read(self, path, size, offset, fh):
-            d, _ = fs.read_file(path.lstrip('/'))
-            return (d or b'')[offset:offset+size]
-        def write(self, path, data, offset, fh):
-            name = path.lstrip('/')
-            old, _ = fs.read_file(name)
-            new = (old or b'')[:offset] + data + (old or b'')[offset+len(data):]
-            fs.write_file(name, new); return len(data)
-        def truncate(self, path, length, fh=None):
-            name = path.lstrip('/')
-            old, _ = fs.read_file(name)
-            fs.write_file(name, (old or b'')[:length]); return 0
-        def unlink(self, path):
-            from tapefs import Directory
-            d, e = fs.list_files()
-            if not e: d.remove(path.lstrip('/')); fs.write_directory(d)
-            return 0
+    if fuse_available:
+        class TapeFS(fuse.Operations):
+            def getattr(self, path, fh=None):
+                st = fuse.Stat()
+                st.st_mode = 0o755; st.st_nlink = 2
+                if path == '/': st.st_mode = 0o755 | 0o40000; return st
+                name = path.lstrip('/')
+                from tapefs import Directory
+                d, e = fs.list_files()
+                if e: return -fuse.ENOENT
+                for x in d.entries:
+                    if x.filename == name:
+                        st.st_mode = 0o644 | 0o100000; st.st_nlink = 1
+                        st.st_size = x.file_size; return st
+                return -fuse.ENOENT
+            def readdir(self, path, fh):
+                yield '.'; yield '..'
+                from tapefs import Directory
+                d, e = fs.list_files()
+                if not e:
+                    for x in d.entries: yield x.filename
+            def open(self, path, flags): return 0
+            def read(self, path, size, offset, fh):
+                d, _ = fs.read_file(path.lstrip('/'))
+                return (d or b'')[offset:offset+size]
+            def write(self, path, data, offset, fh):
+                name = path.lstrip('/')
+                old, _ = fs.read_file(name)
+                new = (old or b'')[:offset] + data + (old or b'')[offset+len(data):]
+                fs.write_file(name, new); return len(data)
+            def truncate(self, path, length, fh=None):
+                name = path.lstrip('/')
+                old, _ = fs.read_file(name)
+                fs.write_file(name, (old or b'')[:length]); return 0
+            def unlink(self, path):
+                from tapefs import Directory
+                d, e = fs.list_files()
+                if not e: d.remove(path.lstrip('/')); fs.write_directory(d)
+                return 0
 
-    fuse_thread = threading.Thread(
-        target=lambda: fuse.FUSE(TapeFS(), mountpoint, foreground=True,
-                                 allow_other=False),
-        daemon=True
-    )
-    fuse_thread.start()
+            # FUSE thread is started after the class definition
 
-    # ---- Start UI update loop ----------------------------------- #
-    print(f"  Mounted at {mountpoint}")
-    print(f"  Debug window open. Close window to unmount.")
+    if fuse_available:
+        fuse_thread = threading.Thread(
+            target=lambda: fuse.FUSE(TapeFS(), mountpoint, foreground=True,
+                                     allow_other=False),
+            daemon=True
+        )
+        fuse_thread.start()
+        print(f"  Mounted at {mountpoint}")
+    else:
+        print(f"  UI only mode (no mount at {mountpoint})")
+
+    print(f"  Debug window open. Close window to exit.")
 
     update_waveform()
     root.after(100, update_status)
