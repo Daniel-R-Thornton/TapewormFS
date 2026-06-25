@@ -384,28 +384,32 @@ def cmd_mount(mountpoint):
             abspath = os.path.abspath(mountpoint)
             print(f"  Mounting at {abspath}")
             
-            # FUSE class — fusepy calls methods on the class
+            # FUSE class with directory cache (avoids hitting firmware on every call)
+            _dir_cache = {'entries': [], 'time': 0.0}
+            
             class TapeFS(fuse.Operations):
+                def _get_dir(self):
+                    if time.monotonic() - _dir_cache['time'] > 2.0:
+                        from tapefs import Directory
+                        d, e = fs.list_files()
+                        if not e:
+                            _dir_cache['entries'] = [(x.filename, x.file_size) for x in d.entries]
+                        _dir_cache['time'] = time.monotonic()
+                    return _dir_cache['entries']
                 def getattr(self, path, fh=None):
                     if path == '/':
                         return {'st_mode': 0o755 | 0o40000, 'st_nlink': 2}
                     name = path.lstrip('/')
-                    from tapefs import Directory
-                    d, e = fs.list_files()
-                    if e: raise fuse.FuseOSError(fuse.ENOENT)
-                    for x in d.entries:
-                        if x.filename == name:
+                    for fn, sz in self._get_dir():
+                        if fn == name:
                             return {'st_mode': 0o644 | 0o100000,
-                                    'st_nlink': 1, 'st_size': x.file_size}
+                                    'st_nlink': 1, 'st_size': sz}
                     raise fuse.FuseOSError(fuse.ENOENT)
                 def readdir(self, path, fh=None):
                     yield '.'
                     yield '..'
-                    from tapefs import Directory
-                    d, e = fs.list_files()
-                    if not e:
-                        for x in d.entries:
-                            yield x.filename
+                    for fn, _ in self._get_dir():
+                        yield fn
                 def open(self, path, flags): return 0
                 def read(self, path, size, offset, fh):
                     d, _ = fs.read_file(path.lstrip('/'))
