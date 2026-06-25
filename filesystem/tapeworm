@@ -385,8 +385,7 @@ def cmd_mount(mountpoint):
             print(f"  Mounting at {abspath}")
             
             # FUSE class — fusepy calls methods on the class
-            class TapeFS:
-                def __init__(self, *a, **kw): pass
+            class TapeFS(fuse.Operations):
                 def getattr(self, path):
                     if path == '/':
                         return {'st_mode': 0o755 | 0o40000, 'st_nlink': 2}
@@ -428,7 +427,7 @@ def cmd_mount(mountpoint):
             
             def fuse_runner():
                 try:
-                    fuse.FUSE(TapeFS, abspath, foreground=True)
+                    fuse.FUSE(TapeFS(), abspath, foreground=True)
                 except Exception as e:
                     print(f"  FUSE error: {e}")
             threading.Thread(target=fuse_runner, daemon=True).start()
