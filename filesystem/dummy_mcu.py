@@ -220,11 +220,9 @@ class DummyMCU:
         mcu = DummyMCU()
         fs  = Filesystem(mcu.write, mcu.read, mcu.seek)
     
-    Standalone TCP server:
+    Stdio mode (subprocess, serial-like pipe):
         mcu = DummyMCU()
-        mcu.run_tcp(port=9725)
-    
-    Stdio mode:
+        mcu.run_stdio()
         mcu = DummyMCU()
         mcu.run_stdio()
     """
@@ -682,27 +680,6 @@ class DummyMCU:
     def set_error_write_protect(self, enabled: bool):
         """Simulate write-protect tab broken."""
         self._error_write_protect = enabled
-
-    # ---- Standalone TCP Server ------------------------------------- #
-
-    def run_tcp(self, host: str = '127.0.0.1', port: int = 9725):
-        """
-        Start TCP server. Accepts one connection and speaks the
-        binary transport protocol.
-        
-        Each message is a framed packet (0xFE marker, escaped, CRC'd).
-        """
-        import socket
-        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        server.bind((host, port))
-        server.listen(1)
-        print(f"[DummyMCU] TCP server listening on {host}:{port}")
-
-        conn, addr = server.accept()
-        print(f"[DummyMCU] Connected by {addr}")
-        self._run_stream(conn)
-        conn.close()
 
     # ---- Stdio Mode ------------------------------------------------ #
 
