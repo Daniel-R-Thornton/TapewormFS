@@ -386,7 +386,7 @@ def cmd_mount(mountpoint):
             
             # FUSE class — fusepy calls methods on the class
             class TapeFS(fuse.Operations):
-                def getattr(self, path):
+                def getattr(self, path, fh=None):
                     if path == '/':
                         return {'st_mode': 0o755 | 0o40000, 'st_nlink': 2}
                     name = path.lstrip('/')
@@ -398,7 +398,7 @@ def cmd_mount(mountpoint):
                             return {'st_mode': 0o644 | 0o100000,
                                     'st_nlink': 1, 'st_size': x.file_size}
                     raise fuse.FuseOSError(fuse.ENOENT)
-                def readdir(self, path, fh):
+                def readdir(self, path, fh=None):
                     yield '.'
                     yield '..'
                     from tapefs import Directory
