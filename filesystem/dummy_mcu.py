@@ -438,11 +438,9 @@ class DummyMCU:
                 return nak(ERR_INVALID_PARAM)
 
             self._state = State.WRITE
-            block_type = payload[0]
-            block_data = payload[1:]
 
-            # Store as a raw block
-            rb = RawBlock(bytes=block_data)
+            # Store the full payload (type + data) as the raw block
+            rb = RawBlock(bytes=payload)
             self._write_buffer.append(rb)
 
             # Simulate write delay (only for first few blocks to be "on tape")
@@ -482,10 +480,12 @@ class DummyMCU:
                     data = bytes(buf)
 
             # Response: block_type(1) + block_data(N) + crc32(4)
+            # block_data = data[1:] (strip the type byte)
             block_type = data[0] if data else 0xFF
-            rsp = bytes([block_type]) + data
+            block_data = data[1:] if len(data) > 1 else b''
+            rsp = bytes([block_type]) + block_data
             # Include CRC-32 of the block data at the end
-            rsp += struct.pack('<I', crc32(data))
+            rsp += struct.pack('<I', crc32(block_data))
             return respond(RSP_READ_NEXT, rsp)
 
         # ---- FLUSH ------------------------------------------------- #
