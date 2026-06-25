@@ -29,8 +29,10 @@
 # Compiled Static libraries
 *.lai
 *.la
-*.a
 *.lib
+
+# Static lib (keep *.a ignored — libtapefs.a is a build artifact)
+*.a
 
 # Executables
 *.exe
@@ -39,3 +41,41 @@
 
 # debug information files
 *.dwo
+
+# ---- Project-specific ----
+
+# Build directories
+build/
+build_*/
+
+# CMake artifacts
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+compile_commands.json
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Node / Vite
+node_modules/
+dist/
+
+# Debug / diagnostic files (created during RS codec debugging)
+src/rs_*.c
+src/*_trace.c
+build/
+
+# Pi session logs
+pi-session-*.html
+
+# Duplicate project checkout
+modem-workshop/
+
+# macOS
+.DS_Store
