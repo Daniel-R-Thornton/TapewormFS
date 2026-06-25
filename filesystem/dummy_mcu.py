@@ -17,6 +17,7 @@ Usage:
 
 import struct
 import time
+import math
 import random
 import sys
 import threading
@@ -254,20 +255,34 @@ class DummyMCU:
             'agc_target': 128,
         }
 
-        # Simulated delays (milliseconds)
-        self._delay_write = 10
-        self._delay_read = 10
-        self._delay_seek_per_block = 5
-        self._delay_rewind = 500
-        self._delay_flush = 20
+        # ---- Realistic tape deck timing (ms) -------------------- #
+        # Base delays
+        self._delay_write = 15          # time to encode one block
+        self._delay_read = 12           # time to decode one block
+        self._delay_seek_per_block = 8  # ms per block when seeking
+        self._delay_rewind = 800        # full rewind time
+        self._delay_flush = 25          # flush buffer to tape
 
-        # Error injection
-        self._error_crc_rate = 0    # inject CRC error every N ops (0 = off)
-        self._error_drop_rate = 0   # drop response every N ops
-        self._error_stall_ms = 0    # extra random stall
+        # ---- Wow/flutter simulation ----------------------------- #
+        # Timing varies sinusoidally to mimic speed instability
+        self._wow_period_ms = 2000      # 0.5 Hz wow cycle
+        self._wow_depth = 0.15          # ±15% speed variation
+        self._flutter_period_ms = 250   # 4 Hz flutter
+        self._flutter_depth = 0.05      # ±5% faster jitter
+        self._sim_time = 0.0            # running simulation clock
+
+        # ---- Error injection ------------------------------------ #
+        self._error_crc_rate = 0        # inject CRC error every N ops (0 = off)
+        self._error_drop_rate = 0       # drop response every N ops
         self._error_no_tape = False
         self._error_write_protect = False
         self._op_count = 0
+
+        # ---- Transient error simulation ------------------------- #
+        self._retry_count = 0           # tracks retries
+        self._max_retries = 3           # max retries before giving up
+        self._dropout_prob = 0.01       # 1% chance of transient failure
+        self._crc_error_prob = 0.02     # 2% chance of CRC error on read
 
         # For transport callbacks (used by Filesystem)
         self._incoming: Optional[RawBlock] = None  # last command
@@ -277,10 +292,70 @@ class DummyMCU:
     # These bypass the packet protocol — they store/retrieve blocks
     # directly, as if talking to a raw tape device.
 
+    # ---- Timing simulation (wow/flutter) ------------------------- #
+
+    def _wow_flutter_delay(self, base_ms: float) -> float:
+        """
+        Apply wow and flutter to a base delay.
+        
+        Returns the actual delay in milliseconds, which varies
+        sinusoidally to simulate tape speed instability.
+        """
+        # Wow: slow oscillation (0.5 Hz)
+        wow = self._wow_depth * math.sin(2 * math.pi * self._sim_time /
+                                          (self._wow_period_ms / 1000.0))
+        # Flutter: faster jitter (4 Hz)
+        flutter = self._flutter_depth * math.sin(2 * math.pi * self._sim_time /
+                                                  (self._flutter_period_ms / 1000.0) +
+                                                  math.pi / 3)
+        variation = 1.0 + wow + flutter
+        return max(base_ms * variation, 1.0)  # at least 1 ms
+
+    def _advance_time(self, dt_ms: float):
+        self._sim_time += dt_ms / 1000.0
+
+    # ---- Transient error simulation ------------------------------ #
+
+    def _maybe_inject_error(self) -> tuple[bool, bool]:
+        """
+        Simulate transient tape errors.
+        
+        Returns (has_crc_error: bool, is_dropout: bool).
+        Errors are transient — retry usually succeeds.
+        """
+        has_crc = random.random() < self._crc_error_prob
+        is_drop = random.random() < self._dropout_prob
+        return has_crc, is_drop
+
+    def _simulate_read_delay(self, is_retry: bool = False):
+        """Sleep for a realistic read time, with wow/flutter."""
+        delay = self._wow_flutter_delay(self._delay_read)
+        if is_retry:
+            delay *= 1.5  # retries take longer (re-syncing)
+        time.sleep(delay / 1000.0)
+        self._advance_time(delay)
+
+    def _simulate_write_delay(self):
+        """Sleep for a realistic write time."""
+        delay = self._wow_flutter_delay(self._delay_write)
+        time.sleep(delay / 1000.0)
+        self._advance_time(delay)
+
+    def _simulate_seek_delay(self, blocks_to_move: int):
+        """Sleep for seek time proportional to block distance."""
+        if blocks_to_move <= 0:
+            return
+        delay = blocks_to_move * self._delay_seek_per_block
+        # Add wow/flutter jitter
+        delay = self._wow_flutter_delay(delay)
+        time.sleep(delay / 1000.0)
+        self._advance_time(delay)
+
     def raw_write(self, block: RawBlock) -> bool:
         """Store a raw block on tape."""
         if self._error_no_tape or self._error_write_protect:
             return False
+        self._simulate_write_delay()
         if self._pos >= len(self._tape):
             self._tape.append(block)
         else:
@@ -289,26 +364,49 @@ class DummyMCU:
         return True
 
     def raw_read(self) -> Optional[RawBlock]:
-        """Read the next raw block from tape."""
+        """Read the next raw block from tape.
+
+        May simulate transient errors (CRC noise, dropout).
+        Errors are retried silently up to _max_retries times.
+        """
         if self._pos >= len(self._tape):
             return None
-        result = self._tape[self._pos]
-        self._pos += 1
-        return result
+
+        for attempt in range(self._max_retries):
+            self._simulate_read_delay(attempt > 0)
+            crc_err, dropout = self._maybe_inject_error()
+
+            if dropout:
+                continue
+
+            result = self._tape[self._pos]
+
+            if crc_err:
+                buf = bytearray(result.bytes)
+                if len(buf) > 4:
+                    buf[-4] ^= 0xFF
+                    result = RawBlock(bytes=bytes(buf))
+                self._pos += 1
+                return result
+
+            self._pos += 1
+            return result
+
+        return None
 
     def raw_seek(self, block_no: int) -> bool:
-        """Position the tape head at a given block."""
+        """Position the tape head at a given block.
+
+        Seek time is proportional to distance (realistic).
+        """
         if self._error_no_tape:
             return False
         blocks = abs(block_no - self._pos)
-        delay = blocks * self._delay_seek_per_block
-        if delay > 0:
-            time.sleep(delay / 1000)
+        self._simulate_seek_delay(blocks)
         self._pos = max(0, min(block_no, len(self._tape)))
         self._bot = (self._pos == 0)
         self._eot = (self._pos >= len(self._tape))
         return True
-
     # ---- Packet protocol callbacks -------------------------------- #
     # These handle the framed transport protocol (0xFE, CRC-16, etc.)
 
