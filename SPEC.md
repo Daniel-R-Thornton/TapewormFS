@@ -33,7 +33,7 @@ Store digital files on standard audio cassette tapes.
 |-------|------|------|
 | **host-driver** | Rust / C (FUSE) | Presents tape as sequential file system to OS |
 | **debug-suite** | TypeScript / Vite | Web-based waveform debugger & visualiser |
-| **firmware** | C / ESP-IDF / Pico SDK | Bit-level encode/decode to audio via SPI DAC/ADC |
+| **firmware** | C / ESP-IDF / Pico SDK | Bit-level encode/decode to audio via I2S (PCM5102A DAC) |
 | **filesystem** | Rust / C | Block allocation, error recovery, directory structure |
 
 ---
@@ -49,7 +49,7 @@ User file  →  host-driver  →  /tmp buffer  →  filesystem layer
       ↓
   modem encode (FreqShift / Basic)
       ↓
-  firmware → SPI DAC → cassette LINE IN
+  firmware → I2S (PCM5102A) → cassette LINE IN
 ```
 
 ### 2.2 Read Path
@@ -457,6 +457,31 @@ Both defined in `debug-suite/src/core/processors/`.
 
 ≥ 500 ms of silence between blocks to allow the cassette deck's AGC to reset and the MCU to process.
 
+### 4.4 PCM5102A DAC Hardware Reference
+
+| Pin | Label | Connect To |
+|-----|-------|------------|
+| 1 | VIN | 3.3 V |
+| 2 | GND | GND |
+| 3 | BCK | MCU I2S bit clock (BCLK) |
+| 4 | DIN | MCU I2S data out (DOUT) |
+| 5 | LCK | MCU I2S word select (LRCK / WS) |
+| 6 | FMT | GND (I2S format, standard) |
+| 7 | XSMT | 3.3 V (enable output) |
+| 8 | SCK | GND (auto-generate from BCK) |
+| 9 | FLT | GND (normal filter) |
+| 10 | DEMP | GND (no de-emphasis) |
+
+**Audio output:** PCM5102A LOUT (pin 16) / ROUT (pin 15) → 3.5 mm jack → cassette LINE IN (AUX).
+
+**I2S config:**
+- Standard I2S Philips format (not left-justified)
+- 16 or 32-bit samples
+- Sample rate tied to modem baud rate (e.g. 44.1 kHz sample rate for 200 baud)
+- BCK = sample_rate × bits_per_sample × 2 (stereo). At 44.1 kHz / 16-bit: BCK ≈ 1.41 MHz
+
+**ADC for read-back:** Cassette LINE OUT → microphone pre-amp → MCU ADC pin or I2S ADC (e.g. PCM1808). For initial prototyping, the ESP32's built-in ADC (2× 12-bit, ~6 kHz usable) is sufficient for low baud rates. A proper I2S ADC gives better SNR for higher rates.
+
 ---
 
 ## 5. Filesystem Format
@@ -615,16 +640,16 @@ A simple TCP server (port 9725) that speaks a text protocol for systems that can
 - [ ] Unsolicited event emission (EVT_STATUS_CHANGE, EVT_PROGRESS, etc.)
 
 ### Phase 4 — Firmware (ESP32)
-- [ ] SPI DAC output (audio generation)
-- [ ] SPI ADC input (audio capture)
+- [ ] I2S output to PCM5102A DAC (audio generation)
+- [ ] I2S / ADC input (audio capture from cassette LINE OUT)
 - [ ] Real-time encode (Basic / FrequencyPulse)
 - [ ] Real-time decode (sync detection, frame correlation)
 - [ ] Motor control (relay / MOSFET)
 - [ ] Position tracking via motor encoder pulses
 
 ### Phase 5 — Firmware (RP2040)
-- [ ] PIO-based DAC/ADC if available
 - [ ] Same as Phase 4, Pico SDK variant
+- [ ] PIO-based I2S for PCM5102A
 
 ### Phase 6 — Host-Driver
 - [ ] FUSE daemon (Rust)
