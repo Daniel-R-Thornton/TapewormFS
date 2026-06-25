@@ -1,22 +1,23 @@
-# 📡 Modem Workshop
+# TapewormFS
 
-A DSP toolkit for building software modems (PSK, OFDM, etc.)
+Store digital files on audio cassette tapes.
 
-## Structure
-src/
-├── core/
-│ ├── DSPEngine.ts # FFT, signal generation, analysis
-│ └── Modulator.ts # BPSK, QPSK, OFDM (you implement!)
-├── visualization/
-│ └── Visualizer.ts # Waveform, spectrogram, constellation
-├── io/
-│ └── AudioIO.ts # Playback, recording, WAV import
-└── main.ts # Main application
+## Architecture
 
-text
+```
+┌─────────────┐    ┌────────────────┐    ┌──────────────┐
+│   /tmp      │───▶│  host-driver   │───▶│  firmware    │
+│ (disk buf)  │    │  (FUSE/9P)     │    │  (ESP32/Pico)│
+└─────────────┘    └────────────────┘    └──────┬───────┘
+                       │                        │
+                       ▼                        ▼
+                ┌──────────────┐         ┌───────────┐
+                │ debug-suite  │         │  cassette │
+                │ (web UI)     │         │  (audio)  │
+                └──────────────┘         └───────────┘
+```
 
-## Quick Start
-
-```bash
-npm install
-npm run dev```
+- **`firmware/`** — MCU drivers (ESP32, RP2040) talking to cassette deck over SPI
+- **`filesystem/`** — Sequential tape filesystem (block alloc, error recovery)
+- **`host-driver/`** — Local app that presents the tape as a sequential FS to the OS
+- **`debug-suite/`** — Web-based modem debugger & waveform visualiser (Vite/TypeScript)
