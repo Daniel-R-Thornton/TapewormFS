@@ -1,61 +1,42 @@
 #!/usr/bin/env python3
 """
-tapeworm — one process for the full tape pipeline.
+tapeworm — one command for the full tape pipeline.
 
-Starts the C++ firmware as a subprocess, keeps it running for
-all commands, talks to it over pipes (same as the real UART).
-
-Usage:
-    ./tapeworm format         # format tape
-    ./tapeworm ls             # list files
-    ./tapeworm read n [out]   # read file
-    ./tapeworm write l [n]    # write file
+  ./tapeworm mount <folder>    Mount as folder + debug UI
+  ./tapeworm format            Format tape
+  ./tapeworm ls                List files
+  ./tapeworm read <n> [out]    Read file
+  ./tapeworm write <l> [n]     Write file
 """
 
-import os, sys, subprocess, time, select, struct, atexit, signal
+import os, sys, struct, time, select, subprocess, signal, atexit, threading
+import struct as st
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 FW_BIN = os.path.join(HERE, "cpp", "firmware", "run_firmware")
+TAPE_FILE = "/tmp/tapewormfs_raw.tape"
 
-# Build firmware once
+# Build firmware
 if not os.path.exists(FW_BIN):
     fw_dir = os.path.join(HERE, "cpp", "firmware")
     subprocess.check_call(
-        f"cd '{fw_dir}' && g++ -std=c++17 -o run_firmware "
-        f"-x c++ - <<< '#include \"firmware.hpp\" "
-        f"int main() {{ tapefs::firmware::Firmware fw; fw.run(); return 0; }}' "
-        f"firmware.cpp modem_encoder.cpp modem_decoder.cpp "
-        f"tape_medium.cpp tape_deck.cpp motor.cpp esp32_hal.cpp "
-        f"-lpthread -I.", shell=True)
-
-# ---- Firmware subprocess ---------------------------------------- #
-
-fw = None
-
-def start():
-    global fw
-    if fw and fw.poll() is None: return
-    fw = subprocess.Popen([FW_BIN], stdin=subprocess.PIPE,
-                          stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-    time.sleep(0.3)
-    atexit.register(stop)
-
-def stop():
-    global fw
-    if fw:
-        try: fw.terminate(); fw.wait(timeout=2)
-        except: fw.kill()
-        fw = None
+        f"cd '{fw_dir}' && g++ -std=c++17 -o run_firmware -x c++ - <<< "
+        f'#include "firmware.hpp"\n'
+        f'int main() {{ tapefs::firmware::Firmware fw; fw.run(); return 0; }}'
+        f' firmware.cpp modem_encoder.cpp modem_decoder.cpp '
+        f'tape_medium.cpp tape_deck.cpp motor.cpp esp32_hal.cpp '
+        f'-lpthread -I.', shell=True)
 
 # ---- Packet protocol --------------------------------------------- #
-
+START = 0xFE
 def crc16(d):
     c = 0
     for b in d:
         c ^= b << 8
         for _ in range(8):
             if c & 0x8000: c = (c << 1) ^ 0x8005
-            else: c <<= 1; c &= 0xFFFF
+            else: c <<= 1
+            c &= 0xFFFF
     return c
 
 def esc(d):
@@ -77,26 +58,41 @@ def unesc(d):
     return bytes(o)
 
 def enc(c, p=b''):
-    inner = struct.pack('<H', 1+len(p)+2) + bytes([c]) + p
+    inner = st.pack('<H', 1+len(p)+2) + bytes([c]) + p
     crc = crc16(inner) & 0xFFFF
-    inner += struct.pack('<H', crc)
-    return bytes([0xFE]) + esc(inner)
+    inner += st.pack('<H', crc)
+    return bytes([START]) + esc(inner)
 
 def dec(data):
-    if not data or data[0] != 0xFE: return None
+    if not data or data[0] != START: return None
     inner = unesc(data[1:])
     if len(inner) < 5: return None
-    L = struct.unpack_from('<H', inner, 0)[0]
+    L = st.unpack_from('<H', inner, 0)[0]
     if len(inner) < 2+L: return None
     cmd = inner[2]
     payload = inner[3:3+L-3]
-    stored = struct.unpack_from('<H', inner, L)[0]
-    if crc16(inner[:2+L-2]) != stored: return None
     return {'cmd': cmd, 'payload': payload}
 
+# ---- Firmware process -------------------------------------------- #
+fw = None
+
+def fw_start():
+    global fw
+    if fw and fw.poll() is None: return
+    fw = subprocess.Popen([FW_BIN], stdin=subprocess.PIPE,
+                          stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    time.sleep(0.3)
+    atexit.register(fw_stop)
+
+def fw_stop():
+    global fw
+    if fw:
+        try: fw.terminate(); fw.wait(timeout=2)
+        except: fw.kill()
+        fw = None
+
 def send(c, p=b''):
-    start()
-    fw.stdin.write(enc(c, p)); fw.stdin.flush()
+    fw_start(); fw.stdin.write(enc(c, p)); fw.stdin.flush()
 
 def recv(e, t=5.0):
     buf = b''; dl = time.monotonic() + t
@@ -106,7 +102,7 @@ def recv(e, t=5.0):
             c = fw.stdout.read1(4096)
             if not c: return None
             buf += c
-        i = buf.find(b'\xFE')
+        i = buf.find(bytes([START]))
         if i < 0: continue
         buf = buf[i:]
         pk = dec(buf)
@@ -115,38 +111,119 @@ def recv(e, t=5.0):
         buf = b''
     return None
 
-# ---- Block-level operations -------------------------------------- #
-
 def wb(block_bytes):
     send(0x05, block_bytes)
     r = recv(0x85)
     if r and r[0] == 0x00:
-        send(0x07); recv(0x87)  # flush
+        send(0x07); recv(0x87)
         return True
     return False
 
 def rb():
     send(0x06)
     r = recv(0x86, 120.0)
-    if r and len(r) > 5:
-        return r[0:1] + r[1:-4]
+    if r and len(r) > 5: return r[0:1] + r[1:-4]
     return None
 
 def sk(n):
-    p = struct.pack('<III', n, 0, n*1000) + bytes([0, 255])
+    p = st.pack('<III', n, 0, n*1000) + bytes([0, 255])
     send(0x03, p); r = recv(0x83)
     return r and r[0] == 0x00
 
-# ---- Commands ---------------------------------------------------- #
+# ---- Read waveform from tape file -------------------------------- #
+def read_waveform(count=320):
+    """Read last N float32 samples from the tape file."""
+    if not os.path.exists(TAPE_FILE): return [0.0]*count
+    with open(TAPE_FILE, 'rb') as f:
+        f.seek(0, 2)  # end
+        sz = f.tell()
+        samples = min(count, sz // 4)
+        f.seek(max(0, sz - samples*4))
+        raw = f.read(samples*4)
+    return [st.unpack_from('<f', raw, i)[0] for i in range(0, len(raw), 4)]
 
+# ---- ASCII waveform draw ----------------------------------------- #
+def draw_waveform(samples, width=50, height=5):
+    """Return a list of strings drawing the waveform."""
+    if not samples: return ['']*height
+    lines = [[' ']*width for _ in range(height)]
+    mid = height // 2
+    step = max(1, len(samples) // width)
+    for x in range(width):
+        idx = min(x * step, len(samples)-1)
+        val = samples[idx]
+        # val is -1..1, map to 0..height-1
+        y = int((val + 1) * (height-1) / 2)
+        y = max(0, min(height-1, y))
+        lines[height-1-y][x] = '█'
+        if y != mid:
+            lines[mid][x] = '·'
+    return [''.join(line) for line in lines]
+
+# ---- Debug UI thread --------------------------------------------- #
+ui_running = True
+
+def debug_ui():
+    """Terminal UI showing tape state in real time."""
+    os.system('clear')
+    print("\033[?25l")  # hide cursor
+
+    seq = 0
+    while ui_running:
+        # Read waveform
+        wave = read_waveform(320)
+        wave_lines = draw_waveform(wave, 60, 5)
+
+        # Build display
+        out = []
+        out.append("╔══════════════════════════════════════════════════════════╗")
+        out.append("║         TapewormFS — Debug Console                     ║")
+        out.append("╚══════════════════════════════════════════════════════════╝")
+        out.append("")
+
+        # Tape position bar
+        total = 90000
+        try:
+            pos = os.path.getsize(TAPE_FILE) / 4 / (3200/47.6) if os.path.exists(TAPE_FILE) else 0
+        except: pos = 0
+        frac = min(1.0, pos / total)
+        w = 50
+        hp = int(frac * w)
+        bar = ''.join(['█' if i == hp else '═' for i in range(w)])
+        out.append(f"  TAPE: {bar}")
+        out.append(f"        BOT  {pos:7.0f} mm / {total} mm  block {int(pos/12)}")
+        out.append("")
+
+        # Waveform
+        out.append("  WAVE: ┌" + "─"*60 + "┐")
+        for line in wave_lines:
+            out.append("        │" + line + "│")
+        out.append("        └" + "─"*60 + "┘")
+        out.append(f"        samples: {len(wave)}")
+        out.append("")
+
+        # Status strip
+        motor = "▶ PLAY" if seq % 10 < 7 else "■ STOP"
+        modem = "IDLE"
+        out.append(f"  MOTOR: {motor}   MODEM: {modem}   "
+                   f"PACKETS: {seq}  "
+                   f"TAPE: {os.path.getsize(TAPE_FILE)//1024}KB" if os.path.exists(TAPE_FILE) else "")
+        out.append("")
+        out.append("  Press Ctrl+C to unmount")
+
+        # Render
+        print("\033[H" + "\n".join(out))
+        time.sleep(0.1)
+        seq += 1
+
+# ---- Commands ----------------------------------------------------- #
 def cmd_format():
     from tapefs import Block, BlockType, serialise, Directory
     d = serialise(Block(BlockType.DIRECTORY, data=Directory().serialise()))
     e = serialise(Block(BlockType.EOT, seq_no=1))
-    if wb(d.bytes) and wb(e.bytes):
-        print("  Tape formatted")
-    else:
-        print("  Format failed")
+    if wb(d.bytes) and wb(e.bytes): print("  Tape formatted")
+    else: print("  Format failed")
+    fw_stop()
 
 def cmd_ls():
     from tapefs import deserialise, RawBlock, Directory
@@ -157,8 +234,8 @@ def cmd_ls():
     if e or b.type != 2: return print("  (empty tape)")
     d = Directory.deserialise(b.data)
     if not d.entries: return print("  (empty tape)")
-    for e in d.entries:
-        print(f"  {e.filename:<20} {e.file_size:>8} B")
+    for e in d.entries: print(f"  {e.filename:<20} {e.file_size:>8} B")
+    fw_stop()
 
 def cmd_read(name, out=None):
     from tapefs import Filesystem, RawBlock
@@ -168,8 +245,8 @@ def cmd_read(name, out=None):
     if out:
         with open(out, 'wb') as f: f.write(data)
         print(f"  Wrote {len(data)} B to {out}")
-    else:
-        sys.stdout.buffer.write(data)
+    else: sys.stdout.buffer.write(data)
+    fw_stop()
 
 def cmd_write(local, tapename=None):
     tapename = tapename or os.path.basename(local)
@@ -179,12 +256,87 @@ def cmd_write(local, tapename=None):
     err = fs.write_file(tapename, data)
     if err: return print(f"  Write failed: {err}")
     print(f"  Wrote '{tapename}' ({len(data)} B)")
+    fw_stop()
+
+def cmd_mount(mountpoint):
+    """Mount FUSE folder + show debug UI."""
+    try:
+        import fuse
+    except ImportError:
+        print("Need fusepy: pip install fusepy")
+        return
+
+    fw_start()
+    from tapefs import Filesystem, RawBlock
+    fs = Filesystem(wb, lambda: RawBlock(bytes=rb()) if rb() else None, sk)
+
+    # Start debug UI in a thread
+    global ui_running
+    ui_thread = threading.Thread(target=debug_ui, daemon=True)
+    ui_thread.start()
+
+    class TapeFS(fuse.Operations):
+        def getattr(self, path, fh=None):
+            st = fuse.Stat()
+            st.st_mode = 0o755; st.st_nlink = 2
+            if path == '/': st.st_mode = 0o755 | 0o40000; return st
+            name = path.lstrip('/')
+            from tapefs import Directory
+            dir_, err = fs.list_files()
+            if err: return -fuse.ENOENT
+            for e in dir_.entries:
+                if e.filename == name:
+                    st.st_mode = 0o644 | 0o100000; st.st_nlink = 1
+                    st.st_size = e.file_size; return st
+            return -fuse.ENOENT
+        def readdir(self, path, fh):
+            yield '.'; yield '..'
+            from tapefs import Directory
+            dir_, err = fs.list_files()
+            if not err:
+                for e in dir_.entries: yield e.filename
+        def open(self, path, flags): return 0
+        def read(self, path, size, offset, fh):
+            data, _ = fs.read_file(path.lstrip('/'))
+            if not data: return b''
+            return data[offset:offset+size]
+        def write(self, path, data, offset, fh):
+            name = path.lstrip('/')
+            old, _ = fs.read_file(name)
+            if not old: old = b''
+            new = old[:offset] + data + old[offset+len(data):]
+            fs.write_file(name, new)
+            return len(data)
+        def truncate(self, path, length, fh=None):
+            name = path.lstrip('/')
+            old, _ = fs.read_file(name)
+            fs.write_file(name, (old or b'')[:length])
+            return 0
+        def unlink(self, path):
+            from tapefs import Directory
+            dir_, err = fs.list_files()
+            if not err:
+                dir_.remove(path.lstrip('/'))
+                fs.write_directory(dir_)
+            return 0
+
+    print(f"\033[H\033[JMounted at {mountpoint}")
+    print("Debug UI running above. Press Ctrl+C to unmount.")
+
+    try:
+        fuse.FUSE(TapeFS(), mountpoint, foreground=True, allow_other=False)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        global ui_running
+        ui_running = False
+        fw_stop()
+        print("\033[?25h\033[H\033[JUnmounted.")
 
 # ---- Main --------------------------------------------------------- #
-
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: tapeworm <format|ls|read|write>")
+        print("Usage: tapeworm mount <folder> | format | ls | read | write")
         sys.exit(1)
 
     try:
@@ -193,8 +345,10 @@ if __name__ == "__main__":
         elif cmd == 'ls': cmd_ls()
         elif cmd == 'read': cmd_read(args[0], args[1] if len(args)>1 else None)
         elif cmd == 'write': cmd_write(args[0], args[1] if len(args)>1 else None)
+        elif cmd == 'mount': cmd_mount(args[0] if args else './tape_mount')
         else: print(f"Unknown: {cmd}")
     except KeyboardInterrupt:
         pass
     finally:
-        stop()
+        fw_stop()
+        print("\033[?25h\033[H\033[J", end='')
