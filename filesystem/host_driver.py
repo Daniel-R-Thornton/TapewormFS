@@ -212,7 +212,7 @@ def decode_packet(data: bytes) -> dict | None:
     if len(inner) < 2 + length: return None
     cmd_id = inner[2]
     payload = inner[3:3 + length - 3]
-    stored = struct.unpack_from('<H', inner, 3 + length - 2)[0]
+    stored = struct.unpack_from('<H', inner, length)[0]
     if crc16(inner[:2 + length - 2]) != stored: return None
     return {'cmd_id': cmd_id, 'payload': payload}
 

@@ -39,6 +39,7 @@ static std::vector<uint8_t> unesc(const std::vector<uint8_t>& d) {
 
 Firmware::Firmware() {
     tape_.setPath("/tmp/tapewormfs_raw.tape");
+    tape_.load();  // load previous tape contents
     TapeDeckConfig dcfg;
     dcfg.baudRate = 200;
     dcfg.blockSize = 1024;
@@ -177,14 +178,18 @@ void Firmware::run() {
     }
 }
 
-// ---- Record / Playback -------------------------------------------- //
-// These use TapeDeck timing and HAL ADC/DAC.
+// ---- Record / Playback — ISR-driven --------------------------------- //
+// On real ESP32, a hardware timer fires at ~3200 Hz.
+// Each tick calls encoder.generateSample() or decoder.feedSample().
+// In simulation, we just call it in a tight loop (same logic).
 
 void Firmware::recordBlock(const std::vector<uint8_t>& data) {
-    fprintf(stderr, "[Record] %zu bytes (baud=%d, ~%.0f ms)\n",
-            data.size(), deck_->blockTimeMs());
+    fprintf(stderr, "[Record] %zu bytes\n", data.size());
     hal::dacSetOutputFile("/tmp/tapewormfs_raw.tape");
-    encoder_.encode(data);
+    encoder_.startEncoding(data);
+    while (encoder_.isEncoding()) {
+        encoder_.generateSample();  // calls hal::dacWriteFloat()
+    }
 }
 
 std::vector<uint8_t> Firmware::playbackBlock() {
@@ -192,13 +197,20 @@ std::vector<uint8_t> Firmware::playbackBlock() {
     if (tape_.sampleCount() == 0) return {};
     hal::adcSetSource(tape_.allSamples());
 
-    std::vector<float> adcInput;
-    for (size_t i = 0; i < tape_.sampleCount(); i++)
-        adcInput.push_back(hal::adcReadFloat(0));
+    decoder_.startDecoding();
+    size_t pos = 0;
+    while (pos < tape_.sampleCount() && !decoder_.isFrameReady()) {
+        float sample = hal::adcReadFloat(0);
+        decoder_.feedSample(sample);
+        pos++;
+    }
 
-    auto result = decoder_.decode(adcInput);
-    fprintf(stderr, "[Playback] decoded %zu bytes\n", result.size());
-    return result;
+    if (decoder_.isFrameReady()) {
+        auto result = decoder_.takeFrame();
+        fprintf(stderr, "[Playback] decoded %zu bytes\n", result.size());
+        return result;
+    }
+    return {};
 }
 
 }} // namespace
