@@ -142,80 +142,6 @@ def read_waveform(count=320):
         raw = f.read(samples*4)
     return [st.unpack_from('<f', raw, i)[0] for i in range(0, len(raw), 4)]
 
-# ---- ASCII waveform draw ----------------------------------------- #
-def draw_waveform(samples, width=50, height=5):
-    """Return a list of strings drawing the waveform."""
-    if not samples: return ['']*height
-    lines = [[' ']*width for _ in range(height)]
-    mid = height // 2
-    step = max(1, len(samples) // width)
-    for x in range(width):
-        idx = min(x * step, len(samples)-1)
-        val = samples[idx]
-        # val is -1..1, map to 0..height-1
-        y = int((val + 1) * (height-1) / 2)
-        y = max(0, min(height-1, y))
-        lines[height-1-y][x] = '█'
-        if y != mid:
-            lines[mid][x] = '·'
-    return [''.join(line) for line in lines]
-
-# ---- Debug UI thread --------------------------------------------- #
-ui_running = True
-
-def debug_ui():
-    """Terminal UI showing tape state in real time."""
-    os.system('clear')
-    print("\033[?25l")  # hide cursor
-
-    seq = 0
-    while ui_running:
-        # Read waveform
-        wave = read_waveform(320)
-        wave_lines = draw_waveform(wave, 60, 5)
-
-        # Build display
-        out = []
-        out.append("╔══════════════════════════════════════════════════════════╗")
-        out.append("║         TapewormFS — Debug Console                     ║")
-        out.append("╚══════════════════════════════════════════════════════════╝")
-        out.append("")
-
-        # Tape position bar
-        total = 90000
-        try:
-            pos = os.path.getsize(TAPE_FILE) / 4 / (3200/47.6) if os.path.exists(TAPE_FILE) else 0
-        except: pos = 0
-        frac = min(1.0, pos / total)
-        w = 50
-        hp = int(frac * w)
-        bar = ''.join(['█' if i == hp else '═' for i in range(w)])
-        out.append(f"  TAPE: {bar}")
-        out.append(f"        BOT  {pos:7.0f} mm / {total} mm  block {int(pos/12)}")
-        out.append("")
-
-        # Waveform
-        out.append("  WAVE: ┌" + "─"*60 + "┐")
-        for line in wave_lines:
-            out.append("        │" + line + "│")
-        out.append("        └" + "─"*60 + "┘")
-        out.append(f"        samples: {len(wave)}")
-        out.append("")
-
-        # Status strip
-        motor = "▶ PLAY" if seq % 10 < 7 else "■ STOP"
-        modem = "IDLE"
-        out.append(f"  MOTOR: {motor}   MODEM: {modem}   "
-                   f"PACKETS: {seq}  "
-                   f"TAPE: {os.path.getsize(TAPE_FILE)//1024}KB" if os.path.exists(TAPE_FILE) else "")
-        out.append("")
-        out.append("  Press Ctrl+C to unmount")
-
-        # Render
-        print("\033[H" + "\n".join(out))
-        time.sleep(0.1)
-        seq += 1
-
 # ---- Commands ----------------------------------------------------- #
 def cmd_format():
     from tapefs import Block, BlockType, serialise, Directory
@@ -259,7 +185,7 @@ def cmd_write(local, tapename=None):
     fw_stop()
 
 def cmd_mount(mountpoint):
-    """Mount FUSE folder + show debug UI."""
+    """Mount FUSE folder + show live GUI debug window."""
     try:
         import fuse
     except ImportError:
@@ -270,11 +196,181 @@ def cmd_mount(mountpoint):
     from tapefs import Filesystem, RawBlock
     fs = Filesystem(wb, lambda: RawBlock(bytes=rb()) if rb() else None, sk)
 
-    # Start debug UI in a thread
-    global ui_running
-    ui_thread = threading.Thread(target=debug_ui, daemon=True)
-    ui_thread.start()
+    # ---- tkinter debug window ----------------------------------- #
+    import tkinter as tk
+    from tkinter import ttk
 
+    root = tk.Tk()
+    root.title("TapewormFS — Live Debug")
+    root.geometry("900x600")
+    root.configure(bg='#1a1a2e')
+
+    # Colors
+    BG      = '#1a1a2e'
+    FG      = '#e0e0e0'
+    ACCENT  = '#00d4aa'
+    WARN    = '#ff6b6b'
+    WAVE_BG = '#16213e'
+
+    # ---- Waveform canvas ---------------------------------------- #
+    wave_frame = tk.Frame(root, bg=BG)
+    wave_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+
+    wave_canvas = tk.Canvas(wave_frame, bg=WAVE_BG, height=200,
+                            highlightthickness=1, highlightbackground='#333')
+    wave_canvas.pack(fill=tk.BOTH, expand=True)
+
+    # ---- Status bar (tape position) ------------------------------ #
+    tape_frame = tk.Frame(root, bg=BG, height=40)
+    tape_frame.pack(fill=tk.X, padx=10, pady=2)
+
+    tape_canvas = tk.Canvas(tape_frame, bg='#0f3460', height=30,
+                            highlightthickness=0)
+    tape_canvas.pack(fill=tk.X)
+
+    # ---- Info row (motor, modem, packets) ------------------------ #
+    info_frame = tk.Frame(root, bg=BG)
+    info_frame.pack(fill=tk.X, padx=10, pady=5)
+
+    motor_lbl = tk.Label(info_frame, text="MOTOR: ■ STOPPED",
+                         fg=WARN, bg=BG, font=('Consolas', 11, 'bold'))
+    motor_lbl.pack(side=tk.LEFT, padx=10)
+
+    modem_lbl = tk.Label(info_frame, text="MODEM: IDLE",
+                         fg=ACCENT, bg=BG, font=('Consolas', 11))
+    modem_lbl.pack(side=tk.LEFT, padx=10)
+
+    pkt_lbl = tk.Label(info_frame, text="PACKETS: 0",
+                       fg=FG, bg=BG, font=('Consolas', 11))
+    pkt_lbl.pack(side=tk.LEFT, padx=10)
+
+    pos_lbl = tk.Label(info_frame, text="POS: 0 mm",
+                       fg=FG, bg=BG, font=('Consolas', 11))
+    pos_lbl.pack(side=tk.RIGHT, padx=10)
+
+    tape_size_lbl = tk.Label(info_frame, text="TAPE: 0 KB",
+                              fg=FG, bg=BG, font=('Consolas', 11))
+    tape_size_lbl.pack(side=tk.RIGHT, padx=10)
+
+    # ---- File list ----------------------------------------------- #
+    file_frame = tk.Frame(root, bg=BG)
+    file_frame.pack(fill=tk.X, padx=10, pady=5)
+
+    file_listbox = tk.Listbox(file_frame, bg='#0f3460', fg=FG,
+                              font=('Consolas', 10), height=6,
+                              selectbackground=ACCENT, borderwidth=0)
+    file_listbox.pack(fill=tk.X)
+
+    # ---- Update functions ---------------------------------------- #
+    packet_count = [0]
+    sample_buffer = [0.0]*500
+
+    def update_waveform():
+        # Read samples from tape file
+        samples = read_waveform(500)
+        if len(samples) >= 2:
+            sample_buffer[:] = samples[-500:]
+
+        # Draw waveform
+        cw = wave_canvas.winfo_width()
+        ch = wave_canvas.winfo_height()
+        if cw < 10: cw = 800
+        if ch < 10: ch = 200
+
+        wave_canvas.delete('all')
+        mid = ch / 2
+
+        if len(sample_buffer) > 1:
+            # Grid lines
+            for y in range(0, ch, 20):
+                wave_canvas.create_line(0, y, cw, y, fill='#1a3a5c', width=1)
+            wave_canvas.create_line(0, mid, cw, mid, fill='#2a4a6c', width=1)
+
+            # Waveform
+            step = max(1, len(sample_buffer) // cw)
+            pts = []
+            for x in range(0, cw):
+                idx = min(x * step, len(sample_buffer)-1)
+                y = mid - sample_buffer[idx] * (ch/2 - 5)
+                y = max(0, min(ch-1, y))
+                pts.extend([x, y])
+            if pts:
+                wave_canvas.create_line(*pts, fill=ACCENT, width=2, smooth=True)
+
+        # Peak marker
+        peak = max(abs(s) for s in sample_buffer) if sample_buffer else 0
+        wave_canvas.create_text(cw-60, 15, text=f"pk={peak:.2f}",
+                                fill='#666', anchor='nw', font=('Consolas', 8))
+
+    def update_status():
+        packet_count[0] += 1
+        pkts = packet_count[0]
+
+        # Motor state (fake for now — would come from GET_STATUS)
+        motor_states = ["■ STOPPED", "▶▶ FAST", "▶ PLAY", "◀◀ REW"]
+        ms = motor_states[(pkts // 20) % 4]
+        motor_lbl.config(text=f"MOTOR: {ms}")
+        motor_lbl.config(fg=WARN if 'STOPPED' in ms else ACCENT)
+
+        # Tape position from file size
+        try:
+            sz = os.path.getsize(TAPE_FILE) if os.path.exists(TAPE_FILE) else 0
+            pos_mm = sz / 4 / (3200 / 47.6) if sz else 0
+            pos_lbl.config(text=f"POS: {pos_mm:.0f} mm")
+            tape_size_lbl.config(text=f"TAPE: {sz//1024} KB")
+
+            # Tape bar
+            tape_canvas.delete('all')
+            tw = tape_canvas.winfo_width()
+            if tw < 10: tw = 800
+            frac = min(1.0, pos_mm / 90000)
+            head_x = int(frac * (tw - 10)) + 5
+
+            # Draw tape
+            tape_canvas.create_line(5, 15, tw-5, 15, fill='#333', width=6)
+            # Written portion
+            written_x = int(frac * (tw - 10)) + 5
+            tape_canvas.create_line(5, 15, written_x, 15, fill=ACCENT, width=6)
+            # Head
+            tape_canvas.create_rectangle(
+                head_x-4, 8, head_x+4, 22, fill=WARN, outline='')
+            # Labels
+            tape_canvas.create_text(5, 25, text='BOT', fill='#666',
+                                    anchor='nw', font=('Consolas', 7))
+            tape_canvas.create_text(tw-5, 25, text='EOT', fill='#666',
+                                    anchor='ne', font=('Consolas', 7))
+            tape_canvas.create_text(tw//2, 3, text=f"{pos_mm:.0f} mm",
+                                    fill=ACCENT, font=('Consolas', 8))
+
+        except Exception:
+            pass
+
+        pkt_lbl.config(text=f"PACKETS: {pkts}")
+
+        # Update files list every 20 frames
+        if pkts % 20 == 0:
+            try:
+                file_listbox.delete(0, tk.END)
+                from tapefs import Directory
+                dir_, err = fs.list_files()
+                if not err:
+                    for e in dir_.entries:
+                        file_listbox.insert(tk.END,
+                            f"  {e.filename:<20} {e.file_size:>8} B")
+            except:
+                pass
+
+        # Schedule next update (~30 FPS)
+        root.after(33, update_status)
+
+    def on_close():
+        global ui_running
+        ui_running = False
+        root.destroy()
+
+    root.protocol("WM_DELETE_WINDOW", on_close)
+
+    # ---- Start FUSE in background thread ------------------------- #
     class TapeFS(fuse.Operations):
         def getattr(self, path, fh=None):
             st = fuse.Stat()
@@ -282,56 +378,67 @@ def cmd_mount(mountpoint):
             if path == '/': st.st_mode = 0o755 | 0o40000; return st
             name = path.lstrip('/')
             from tapefs import Directory
-            dir_, err = fs.list_files()
-            if err: return -fuse.ENOENT
-            for e in dir_.entries:
-                if e.filename == name:
+            d, e = fs.list_files()
+            if e: return -fuse.ENOENT
+            for x in d.entries:
+                if x.filename == name:
                     st.st_mode = 0o644 | 0o100000; st.st_nlink = 1
-                    st.st_size = e.file_size; return st
+                    st.st_size = x.file_size; return st
             return -fuse.ENOENT
         def readdir(self, path, fh):
             yield '.'; yield '..'
             from tapefs import Directory
-            dir_, err = fs.list_files()
-            if not err:
-                for e in dir_.entries: yield e.filename
+            d, e = fs.list_files()
+            if not e:
+                for x in d.entries: yield x.filename
         def open(self, path, flags): return 0
         def read(self, path, size, offset, fh):
-            data, _ = fs.read_file(path.lstrip('/'))
-            if not data: return b''
-            return data[offset:offset+size]
+            d, _ = fs.read_file(path.lstrip('/'))
+            return (d or b'')[offset:offset+size]
         def write(self, path, data, offset, fh):
             name = path.lstrip('/')
             old, _ = fs.read_file(name)
-            if not old: old = b''
-            new = old[:offset] + data + old[offset+len(data):]
-            fs.write_file(name, new)
-            return len(data)
+            new = (old or b'')[:offset] + data + (old or b'')[offset+len(data):]
+            fs.write_file(name, new); return len(data)
         def truncate(self, path, length, fh=None):
             name = path.lstrip('/')
             old, _ = fs.read_file(name)
-            fs.write_file(name, (old or b'')[:length])
-            return 0
+            fs.write_file(name, (old or b'')[:length]); return 0
         def unlink(self, path):
             from tapefs import Directory
-            dir_, err = fs.list_files()
-            if not err:
-                dir_.remove(path.lstrip('/'))
-                fs.write_directory(dir_)
+            d, e = fs.list_files()
+            if not e: d.remove(path.lstrip('/')); fs.write_directory(d)
             return 0
 
-    print(f"\033[H\033[JMounted at {mountpoint}")
-    print("Debug UI running above. Press Ctrl+C to unmount.")
+    fuse_thread = threading.Thread(
+        target=lambda: fuse.FUSE(TapeFS(), mountpoint, foreground=True,
+                                 allow_other=False),
+        daemon=True
+    )
+    fuse_thread.start()
+
+    # ---- Start UI update loop ----------------------------------- #
+    print(f"  Mounted at {mountpoint}")
+    print(f"  Debug window open. Close window to unmount.")
+
+    update_waveform()
+    root.after(100, update_status)
+    root.after(50, lambda: root.after(50, update_waveform()))
+
+    # Schedule waveform updates at ~20 FPS
+    def wave_loop():
+        update_waveform()
+        root.after(50, wave_loop)
+    root.after(50, wave_loop)
 
     try:
-        fuse.FUSE(TapeFS(), mountpoint, foreground=True, allow_other=False)
+        root.mainloop()
     except KeyboardInterrupt:
         pass
     finally:
-        global ui_running
         ui_running = False
         fw_stop()
-        print("\033[?25h\033[H\033[JUnmounted.")
+        print("  Unmounted.")
 
 # ---- Main --------------------------------------------------------- #
 if __name__ == "__main__":
