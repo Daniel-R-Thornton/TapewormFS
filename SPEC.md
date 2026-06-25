@@ -33,7 +33,7 @@ Store digital files on standard audio cassette tapes.
 |-------|------|------|
 | **host-driver** | Rust / C (FUSE) | Presents tape as sequential file system to OS |
 | **debug-suite** | TypeScript / Vite | Web-based waveform debugger & visualiser |
-| **firmware** | C / ESP-IDF / Pico SDK | Bit-level encode/decode to audio via I2S (PCM5102A DAC) |
+| **firmware** | C / ESP-IDF / Pico SDK | Bit-level encode/decode to audio via I2C (MCP4725 DAC) |
 | **filesystem** | Rust / C | Block allocation, error recovery, directory structure |
 
 ---
@@ -49,7 +49,7 @@ User file  →  host-driver  →  /tmp buffer  →  filesystem layer
       ↓
   modem encode (FreqShift / Basic)
       ↓
-  firmware → I2S (PCM5102A) → cassette LINE IN
+  firmware → I2C (MCP4725) → cassette LINE IN
 ```
 
 ### 2.2 Read Path
@@ -457,30 +457,39 @@ Both defined in `debug-suite/src/core/processors/`.
 
 ≥ 500 ms of silence between blocks to allow the cassette deck's AGC to reset and the MCU to process.
 
-### 4.4 PCM5102A DAC Hardware Reference
+### 4.4 MCP4725 DAC Hardware Reference
 
 | Pin | Label | Connect To |
 |-----|-------|------------|
-| 1 | VIN | 3.3 V |
-| 2 | GND | GND |
-| 3 | BCK | MCU I2S bit clock (BCLK) |
-| 4 | DIN | MCU I2S data out (DOUT) |
-| 5 | LCK | MCU I2S word select (LRCK / WS) |
-| 6 | FMT | GND (I2S format, standard) |
-| 7 | XSMT | 3.3 V (enable output) |
-| 8 | SCK | GND (auto-generate from BCK) |
-| 9 | FLT | GND (normal filter) |
-| 10 | DEMP | GND (no de-emphasis) |
+| 1 | VOUT | 3.5 mm jack centre → cassette LINE IN |
+| 2 | GND | GND (also to jack sleeve) |
+| 3 | VDD | 3.3 V |
+| 4 | SDA | MCU I2C data (GPIO 21 on ESP32, GPIO 4 on Pico) |
+| 5 | SCL | MCU I2C clock (GPIO 22 on ESP32, GPIO 5 on Pico) |
+| 6 | A0 | GND (address 0x60) or 3.3 V (address 0x61) |
 
-**Audio output:** PCM5102A LOUT (pin 16) / ROUT (pin 15) → 3.5 mm jack → cassette LINE IN (AUX).
+**Audio output:** MCP4725 VOUT → 3.5 mm jack tip → cassette deck LINE IN. GND to sleeve.
 
-**I2S config:**
-- Standard I2S Philips format (not left-justified)
-- 16 or 32-bit samples
-- Sample rate tied to modem baud rate (e.g. 44.1 kHz sample rate for 200 baud)
-- BCK = sample_rate × bits_per_sample × 2 (stereo). At 44.1 kHz / 16-bit: BCK ≈ 1.41 MHz
+**I2C config:**
+- Address: `0x60` (A0=GND) or `0x61` (A0=3.3V)
+- 12-bit DAC value: 0–4095
+- Write format: `0x40` (write DAC register) + value_hi (4-bit) + value_lo (8-bit)
+- Max I2C speed: 400 kHz (fast mode). At 400 kHz, ~30k updates/s achievable
+- No hardware sample clock — MCU timer ISR drives updates
+- Output buffer: MCP4725 has no FIFO — each sample must be written individually over I2C
 
-**ADC for read-back:** Cassette LINE OUT → microphone pre-amp → MCU ADC pin or I2S ADC (e.g. PCM1808). For initial prototyping, the ESP32's built-in ADC (2× 12-bit, ~6 kHz usable) is sufficient for low baud rates. A proper I2S ADC gives better SNR for higher rates.
+**Sample rate limit:**
+
+| I2C Speed | Theoretical max | Practical (with overhead) |
+|-----------|----------------|---------------------------|
+| 100 kHz (std) | ~8 kHz | ~5 kHz usable |
+| 400 kHz (fast) | ~28 kHz | ~18 kHz usable |
+
+For a 200 baud modem with 1024 samples/frame, sample rate of ~8 kHz is sufficient → std I2C is fine.
+
+**Output conditioning:** Place a 10 µF electrolytic + 100 nF ceramic capacitor between VOUT and GND to smooth the DAC output. A 1 kΩ resistor in series with the output limits current to the cassette deck's LINE IN.
+
+**ADC for read-back:** Cassette LINE OUT → voltage divider (to drop cassette output to 3.3 V range) → MCU ADC pin. ESP32's built-in ADC (2× 12-bit, ~6 kHz usable) is sufficient for low baud rates. For better quality, an external I2C ADC (e.g. ADS1115, 16-bit, up to 860 Hz) or I2S ADC (e.g. PCM1808) can be added.
 
 ---
 
@@ -640,8 +649,8 @@ A simple TCP server (port 9725) that speaks a text protocol for systems that can
 - [ ] Unsolicited event emission (EVT_STATUS_CHANGE, EVT_PROGRESS, etc.)
 
 ### Phase 4 — Firmware (ESP32)
-- [ ] I2S output to PCM5102A DAC (audio generation)
-- [ ] I2S / ADC input (audio capture from cassette LINE OUT)
+- [ ] I2C output to MCP4725 DAC (audio generation via timer ISR)
+- [ ] ADC input (audio capture from cassette LINE OUT via MCU ADC or external)
 - [ ] Real-time encode (Basic / FrequencyPulse)
 - [ ] Real-time decode (sync detection, frame correlation)
 - [ ] Motor control (relay / MOSFET)
@@ -649,7 +658,7 @@ A simple TCP server (port 9725) that speaks a text protocol for systems that can
 
 ### Phase 5 — Firmware (RP2040)
 - [ ] Same as Phase 4, Pico SDK variant
-- [ ] PIO-based I2S for PCM5102A
+- [ ] I2C master for MCP4725 via PIO or hardware I2C
 
 ### Phase 6 — Host-Driver
 - [ ] FUSE daemon (Rust)
