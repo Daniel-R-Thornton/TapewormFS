@@ -227,22 +227,36 @@ class DummyMCU:
         mcu.run_stdio()
     """
 
-    def __init__(self, initial_tape: Optional[list[RawBlock]] = None):
-        # Tape storage
-        self._tape: list[RawBlock] = list(initial_tape) if initial_tape else []
+    def __init__(self, initial_tape: Optional[list[RawBlock]] = None,
+                 speed: str = 'fast'):
+        """
+        Args:
+            initial_tape: Pre-populated blocks.
+            speed: 'fast' (unit tests) or 'realistic' (hardware-accurate delays).
+        """
+        # Tape storage — blocks stored as (block_number, RawBlock) tuples
+        # to track where each block lives on the physical tape
+        self._tape: list[tuple[int, RawBlock]] = []
+        if initial_tape:
+            for i, b in enumerate(initial_tape):
+                self._tape.append((i, b))
+
+        # Physical tape map: block_number -> position_ms from BOT
+        # This simulates actual physical locations on the tape
+        self._tape_map: dict[int, int] = {}
+        self._next_phys_block = 0  # next physical block number
 
         # State machine
         self._state = State.IDLE
-        self._pos = 0  # current block position on tape
-        self._write_buffer: list[RawBlock] = []  # buffered writes
+        self._pos = 0  # current position in tape array
+        self._write_buffer: list[tuple[int, RawBlock]] = []  # buffered writes
 
         # Simulated flags
         self._tape_present = True
         self._write_protect = False
-        self._bot = True      # at beginning of tape?
-        self._eot = False     # at end of tape?
-        self._pos_locked = True  # always locked in sim
-        self._crc_error = False
+        self._bot = True
+        self._eot = False
+        self._pos_locked = True
 
         # Config (from SET_CONFIG)
         self._config = {
@@ -253,42 +267,98 @@ class DummyMCU:
             'agc_target': 128,
         }
 
-        # ---- Realistic tape deck timing (ms) -------------------- #
-        # Base delays
-        self._delay_write = 15          # time to encode one block
-        self._delay_read = 12           # time to decode one block
-        self._delay_seek_per_block = 8  # ms per block when seeking
-        self._delay_rewind = 800        # full rewind time
-        self._delay_flush = 25          # flush buffer to tape
+        # ---- Realistic timing ---------------------------------- #
+        # All delays are based on actual tape physics:
+        #   - Read/write time = bits_per_block / baud_rate
+        #   - Seek time = |pos_a - pos_b| / tape_speed_mm_s
+        #
+        # A C60 cassette runs at ~4.76 cm/s. Blocks are ~1 cm apart = ~210ms/block.
+
+        self._baud_rate = 200
+        self._frame_size = 1024       # bytes per frame on tape
+        self._tape_speed_mm_s = 47.6  # standard cassette: 4.76 cm/s
+        self._block_spacing_mm = 10.0 # approximate mm between blocks on tape
+        self._motor_start_ms = 300    # time to spin motor up to speed
+
+        if speed == 'realistic':
+            # Hardware-accurate delays (slow — for demos)
+            self._mode = 'realistic'
+        else:
+            # Fast mode (for unit tests) — delays are scaled down
+            # but still proportional to distance
+            self._mode = 'fast'
 
         # ---- Wow/flutter simulation ----------------------------- #
-        # Timing varies sinusoidally to mimic speed instability
-        self._wow_period_ms = 2000      # 0.5 Hz wow cycle
-        self._wow_depth = 0.15          # ±15% speed variation
-        self._flutter_period_ms = 250   # 4 Hz flutter
-        self._flutter_depth = 0.05      # ±5% faster jitter
-        self._sim_time = 0.0            # running simulation clock
+        self._wow_period_ms = 2000
+        self._wow_depth = 0.15
+        self._flutter_period_ms = 250
+        self._flutter_depth = 0.05
+        self._sim_time = 0.0
 
         # ---- Error injection ------------------------------------ #
-        self._error_crc_rate = 0        # inject CRC error every N ops (0 = off)
-        self._error_drop_rate = 0       # drop response every N ops
+        self._error_crc_rate = 0
+        self._error_drop_rate = 0
         self._error_no_tape = False
         self._error_write_protect = False
         self._op_count = 0
 
         # ---- Transient error simulation ------------------------- #
-        self._retry_count = 0           # tracks retries
-        self._max_retries = 3           # max retries before giving up
-        self._dropout_prob = 0.01       # 1% chance of transient failure
-        self._crc_error_prob = 0.02     # 2% chance of CRC error on read
+        self._max_retries = 3
+        self._dropout_prob = 0.01
+        self._crc_error_prob = 0.02
 
-        # For transport callbacks (used by Filesystem)
-        self._incoming: Optional[RawBlock] = None  # last command
-        self._outgoing: Optional[RawBlock] = None  # next response
+        # For transport callbacks
+        self._incoming: Optional[RawBlock] = None
+        self._outgoing: Optional[RawBlock] = None
 
     # ---- Raw block callbacks (for Filesystem) -------------------- #
     # These bypass the packet protocol — they store/retrieve blocks
     # directly, as if talking to a raw tape device.
+
+    def _block_time_ms(self) -> float:
+        """
+        Time to transfer one block at the current baud rate.
+        
+        A block of frame_size bytes takes:
+          frame_size * 8 bits/byte / baud_rate seconds
+        Plus modem overhead (sync preamble, guard intervals).
+        """
+        raw_bits = self._frame_size * 8
+        overhead_factor = 1.3  # 30% overhead for sync/guards
+        return (raw_bits / self._baud_rate) * 1000 * overhead_factor
+
+    def _block_spacing_ms(self) -> float:
+        """
+        Time for the tape to travel from one block to the next.
+        
+        At standard cassette speed (4.76 cm/s), blocks spaced
+        ~10 mm apart take 10 / 47.6 * 1000 = ~210 ms.
+        """
+        return (self._block_spacing_mm / self._tape_speed_mm_s) * 1000
+
+    def _travel_time_ms(self, from_block: int, to_block: int) -> float:
+        """
+        Time to move the tape from one block position to another.
+        Includes motor start-up time.
+        """
+        if from_block == to_block:
+            return 0
+        distance = abs(to_block - from_block)
+        travel = distance * self._block_spacing_ms()
+        return self._motor_start_ms + travel
+
+    def _block_phys_pos(self, block_no: int) -> int:
+        """Get the physical tape position (ms from BOT) of a block."""
+        # Estimate: blocks are evenly spaced on tape
+        return int(block_no * self._block_spacing_ms())
+
+    # ---- Scaling ------------------------------------------------ #
+    # In 'fast' mode, delays are divided by this factor so unit
+    # tests don't take forever.  The *proportions* are preserved.
+
+    @property
+    def _time_scale(self) -> float:
+        return 0.001 if self._mode == 'fast' else 1.0
 
     # ---- Timing simulation (wow/flutter) ------------------------- #
 
@@ -299,15 +369,14 @@ class DummyMCU:
         Returns the actual delay in milliseconds, which varies
         sinusoidally to simulate tape speed instability.
         """
-        # Wow: slow oscillation (0.5 Hz)
         wow = self._wow_depth * math.sin(2 * math.pi * self._sim_time /
                                           (self._wow_period_ms / 1000.0))
-        # Flutter: faster jitter (4 Hz)
         flutter = self._flutter_depth * math.sin(2 * math.pi * self._sim_time /
                                                   (self._flutter_period_ms / 1000.0) +
                                                   math.pi / 3)
         variation = 1.0 + wow + flutter
-        return max(base_ms * variation, 1.0)  # at least 1 ms
+        scaled = base_ms * self._time_scale * variation
+        return max(scaled, 0.1)  # at least 0.1ms
 
     def _advance_time(self, dt_ms: float):
         self._sim_time += dt_ms / 1000.0
@@ -325,26 +394,26 @@ class DummyMCU:
         is_drop = random.random() < self._dropout_prob
         return has_crc, is_drop
 
-    def _simulate_read_delay(self, is_retry: bool = False):
-        """Sleep for a realistic read time, with wow/flutter."""
-        delay = self._wow_flutter_delay(self._delay_read)
+    def _simulate_read_delay(self, block_no: int = 0, is_retry: bool = False):
+        """Sleep for a realistic read time."""
+        delay = self._block_time_ms()
         if is_retry:
             delay *= 1.5  # retries take longer (re-syncing)
+        delay = self._wow_flutter_delay(delay)
         time.sleep(delay / 1000.0)
         self._advance_time(delay)
 
     def _simulate_write_delay(self):
         """Sleep for a realistic write time."""
-        delay = self._wow_flutter_delay(self._delay_write)
+        delay = self._wow_flutter_delay(self._block_time_ms())
         time.sleep(delay / 1000.0)
         self._advance_time(delay)
 
-    def _simulate_seek_delay(self, blocks_to_move: int):
-        """Sleep for seek time proportional to block distance."""
-        if blocks_to_move <= 0:
+    def _simulate_seek_delay(self, from_block: int, to_block: int):
+        """Sleep for seek time proportional to physical distance."""
+        if from_block == to_block:
             return
-        delay = blocks_to_move * self._delay_seek_per_block
-        # Add wow/flutter jitter
+        delay = self._travel_time_ms(from_block, to_block)
         delay = self._wow_flutter_delay(delay)
         time.sleep(delay / 1000.0)
         self._advance_time(delay)
@@ -354,10 +423,17 @@ class DummyMCU:
         if self._error_no_tape or self._error_write_protect:
             return False
         self._simulate_write_delay()
+
+        # Store block and record its physical position
+        block_no = self._next_phys_block
+        self._next_phys_block += 1
+
         if self._pos >= len(self._tape):
-            self._tape.append(block)
+            self._tape.append((block_no, block))
         else:
-            self._tape[self._pos] = block
+            self._tape[self._pos] = (block_no, block)
+
+        self._tape_map[block_no] = self._block_phys_pos(block_no)
         self._pos += 1
         return True
 
@@ -371,36 +447,46 @@ class DummyMCU:
             return None
 
         for attempt in range(self._max_retries):
-            self._simulate_read_delay(attempt > 0)
+            block_no, rb = self._tape[self._pos]
+            self._simulate_read_delay(block_no, attempt > 0)
             crc_err, dropout = self._maybe_inject_error()
 
             if dropout:
                 continue
 
-            result = self._tape[self._pos]
-
             if crc_err:
-                buf = bytearray(result.bytes)
+                buf = bytearray(rb.bytes)
                 if len(buf) > 4:
                     buf[-4] ^= 0xFF
-                    result = RawBlock(bytes=bytes(buf))
+                    rb = RawBlock(bytes=bytes(buf))
                 self._pos += 1
-                return result
+                return rb
 
             self._pos += 1
-            return result
+            return rb
 
         return None
 
     def raw_seek(self, block_no: int) -> bool:
         """Position the tape head at a given block.
 
-        Seek time is proportional to distance (realistic).
+        Seek time depends on physical distance between current
+        and target position on the tape (realistic).
         """
         if self._error_no_tape:
             return False
-        blocks = abs(block_no - self._pos)
-        self._simulate_seek_delay(blocks)
+
+        # Find current physical position from tape map
+        current_phys = 0
+        if 0 <= self._pos < len(self._tape):
+            current_phys = self._tape_map.get(self._tape[self._pos][0], 0)
+
+        # Target physical position
+        target_phys = self._block_phys_pos(block_no)
+
+        # Seek based on physical distance, not block count
+        self._simulate_seek_delay(current_phys, target_phys)
+
         self._pos = max(0, min(block_no, len(self._tape)))
         self._bot = (self._pos == 0)
         self._eot = (self._pos >= len(self._tape))
@@ -539,10 +625,10 @@ class DummyMCU:
             rb = RawBlock(bytes=payload)
             self._write_buffer.append(rb)
 
-            # Simulate write delay (only for first few blocks to be "on tape")
-            # In real life, blocks are buffered and written asynchronously
-            if self._delay_write > 0 and len(self._write_buffer) <= 3:
-                time.sleep(self._delay_write / 1000)
+            # Simulate write delay (realistic timing at current baud rate)
+            if self._mode == 'realistic' and len(self._write_buffer) <= 3:
+                delay = self._wow_flutter_delay(self._block_time_ms())
+                time.sleep(delay / 1000)
 
             return respond(RSP_WRITE_BLOCK, bytes([0]))
 
@@ -557,11 +643,16 @@ class DummyMCU:
             if self._pos >= len(self._tape):
                 return nak(ERR_NO_TAPE)  # "no more blocks"
 
-            # Simulate read delay
-            if self._delay_read > 0:
-                time.sleep(self._delay_read / 1000)
+            # Simulate read delay (realistic timing at current baud rate)
+            delay = self._wow_flutter_delay(self._block_time_ms())
+            time.sleep(delay / 1000)
 
-            block = self._tape[self._pos]
+            block_raw = self._tape[self._pos]
+            if isinstance(block_raw, tuple):
+                _, block_rb = block_raw
+            else:
+                block_rb = block_raw
+            block = block_rb
             self._pos += 1
             self._bot = (self._pos == 0)
             self._eot = (self._pos >= len(self._tape))
@@ -590,11 +681,14 @@ class DummyMCU:
                 return nak(ERR_INVALID_STATE)
 
             # "Write" all buffered blocks to tape
-            if self._delay_flush > 0:
-                time.sleep(self._delay_flush / 1000)
+            delay = self._wow_flutter_delay(self._block_time_ms())
+            time.sleep(delay / 1000)
 
             for rb in self._write_buffer:
-                self._tape.append(rb)
+                bn = self._next_phys_block
+                self._next_phys_block += 1
+                self._tape.append((bn, rb))
+                self._tape_map[bn] = self._block_phys_pos(bn)
             self._write_buffer.clear()
 
             self._state = State.IDLE
@@ -657,7 +751,7 @@ class DummyMCU:
     @property
     def tape(self) -> list[RawBlock]:
         """The raw blocks stored on the simulated tape."""
-        return list(self._tape)
+        return [rb for (_, rb) in self._tape]
 
     @property
     def tape_size(self) -> int:
