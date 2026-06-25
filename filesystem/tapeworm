@@ -9,7 +9,7 @@ tapeworm — one command for the full tape pipeline.
   ./tapeworm write <l> [n]     Write file
 """
 
-import os, sys, struct, time, select, subprocess, signal, atexit, threading
+import os, sys, struct, time, select, subprocess, signal, atexit, threading, errno
 import struct as st
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -185,298 +185,98 @@ def cmd_write(local, tapename=None):
     fw_stop()
 
 def cmd_mount(mountpoint):
-    """Mount FUSE folder + show live GUI debug window."""
-    fuse_available = False
-    try:
-        import fuse
-        fuse_available = True
-    except ImportError:
-        print("  Note: fusepy not installed. Filesystem operations disabled.")
-        print("  Install with: pip install fusepy")
-        print("  The debug UI will still show.")
+    """Mount FUSE folder with live status file + background cache."""
+    import fuse
 
     fw_start()
-    from tapefs import Filesystem, RawBlock
+    from tapefs import Filesystem, RawBlock, Directory
     fs = Filesystem(wb, lambda: RawBlock(bytes=rb()) if rb() else None, sk)
 
-    # ---- tkinter debug window ----------------------------------- #
-    import tkinter as tk
-    from tkinter import ttk
+    # ---- Status + directory cache (never blocks FUSE) ---------- #
+    status = {'text': 'LOADING...', 'pct': 0}
+    dir_cache = []
 
-    root = tk.Tk()
-    root.attributes("-topmost", True)
-    root.lift()
-    root.title("TapewormFS — Live Debug")
-    root.geometry("900x600")
-    root.configure(bg='#1a1a2e')
-
-    # Colors
-    BG      = '#1a1a2e'
-    FG      = '#e0e0e0'
-    ACCENT  = '#00d4aa'
-    WARN    = '#ff6b6b'
-    WAVE_BG = '#16213e'
-
-    # ---- Waveform canvas ---------------------------------------- #
-    wave_frame = tk.Frame(root, bg=BG)
-    wave_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
-
-    wave_canvas = tk.Canvas(wave_frame, bg=WAVE_BG, height=200,
-                            highlightthickness=1, highlightbackground='#333')
-    wave_canvas.pack(fill=tk.BOTH, expand=True)
-
-    # ---- Status bar (tape position) ------------------------------ #
-    tape_frame = tk.Frame(root, bg=BG, height=40)
-    tape_frame.pack(fill=tk.X, padx=10, pady=2)
-
-    tape_canvas = tk.Canvas(tape_frame, bg='#0f3460', height=30,
-                            highlightthickness=0)
-    tape_canvas.pack(fill=tk.X)
-
-    # ---- Info row (motor, modem, packets) ------------------------ #
-    info_frame = tk.Frame(root, bg=BG)
-    info_frame.pack(fill=tk.X, padx=10, pady=5)
-
-    motor_lbl = tk.Label(info_frame, text="MOTOR: ■ STOPPED",
-                         fg=WARN, bg=BG, font=('Consolas', 11, 'bold'))
-    motor_lbl.pack(side=tk.LEFT, padx=10)
-
-    modem_lbl = tk.Label(info_frame, text="MODEM: IDLE",
-                         fg=ACCENT, bg=BG, font=('Consolas', 11))
-    modem_lbl.pack(side=tk.LEFT, padx=10)
-
-    pkt_lbl = tk.Label(info_frame, text="PACKETS: 0",
-                       fg=FG, bg=BG, font=('Consolas', 11))
-    pkt_lbl.pack(side=tk.LEFT, padx=10)
-
-    pos_lbl = tk.Label(info_frame, text="POS: 0 mm",
-                       fg=FG, bg=BG, font=('Consolas', 11))
-    pos_lbl.pack(side=tk.RIGHT, padx=10)
-
-    tape_size_lbl = tk.Label(info_frame, text="TAPE: 0 KB",
-                              fg=FG, bg=BG, font=('Consolas', 11))
-    tape_size_lbl.pack(side=tk.RIGHT, padx=10)
-
-    # ---- File list ----------------------------------------------- #
-    file_frame = tk.Frame(root, bg=BG)
-    file_frame.pack(fill=tk.X, padx=10, pady=5)
-
-    file_listbox = tk.Listbox(file_frame, bg='#0f3460', fg=FG,
-                              font=('Consolas', 10), height=6,
-                              selectbackground=ACCENT, borderwidth=0)
-    file_listbox.pack(fill=tk.X)
-
-    # ---- Update functions ---------------------------------------- #
-    packet_count = [0]
-    sample_buffer = [0.0]*500
-
-    def update_waveform():
-        # Read samples from tape file
-        samples = read_waveform(500)
-        if len(samples) >= 2:
-            sample_buffer[:] = samples[-500:]
-
-        # Draw waveform
-        cw = wave_canvas.winfo_width()
-        ch = wave_canvas.winfo_height()
-        if cw < 10: cw = 800
-        if ch < 10: ch = 200
-
-        wave_canvas.delete('all')
-        mid = ch / 2
-
-        if len(sample_buffer) > 1:
-            # Grid lines
-            for y in range(0, ch, 20):
-                wave_canvas.create_line(0, y, cw, y, fill='#1a3a5c', width=1)
-            wave_canvas.create_line(0, mid, cw, mid, fill='#2a4a6c', width=1)
-
-            # Waveform
-            step = max(1, len(sample_buffer) // cw)
-            pts = []
-            for x in range(0, cw):
-                idx = min(x * step, len(sample_buffer)-1)
-                y = mid - sample_buffer[idx] * (ch/2 - 5)
-                y = max(0, min(ch-1, y))
-                pts.extend([x, y])
-            if pts:
-                wave_canvas.create_line(*pts, fill=ACCENT, width=2, smooth=True)
-
-        # Peak marker
-        peak = max(abs(s) for s in sample_buffer) if sample_buffer else 0
-        wave_canvas.create_text(cw-60, 15, text=f"pk={peak:.2f}",
-                                fill='#666', anchor='nw', font=('Consolas', 8))
-
-    def update_status():
-        packet_count[0] += 1
-        pkts = packet_count[0]
-
-        # Motor state (fake for now — would come from GET_STATUS)
-        motor_states = ["■ STOPPED", "▶▶ FAST", "▶ PLAY", "◀◀ REW"]
-        ms = motor_states[(pkts // 20) % 4]
-        motor_lbl.config(text=f"MOTOR: {ms}")
-        motor_lbl.config(fg=WARN if 'STOPPED' in ms else ACCENT)
-
-        # Tape position from file size
-        try:
-            sz = os.path.getsize(TAPE_FILE) if os.path.exists(TAPE_FILE) else 0
-            pos_mm = sz / 4 / (3200 / 47.6) if sz else 0
-            pos_lbl.config(text=f"POS: {pos_mm:.0f} mm")
-            tape_size_lbl.config(text=f"TAPE: {sz//1024} KB")
-
-            # Tape bar
-            tape_canvas.delete('all')
-            tw = tape_canvas.winfo_width()
-            if tw < 10: tw = 800
-            frac = min(1.0, pos_mm / 90000)
-            head_x = int(frac * (tw - 10)) + 5
-
-            # Draw tape
-            tape_canvas.create_line(5, 15, tw-5, 15, fill='#333', width=6)
-            # Written portion
-            written_x = int(frac * (tw - 10)) + 5
-            tape_canvas.create_line(5, 15, written_x, 15, fill=ACCENT, width=6)
-            # Head
-            tape_canvas.create_rectangle(
-                head_x-4, 8, head_x+4, 22, fill=WARN, outline='')
-            # Labels
-            tape_canvas.create_text(5, 25, text='BOT', fill='#666',
-                                    anchor='nw', font=('Consolas', 7))
-            tape_canvas.create_text(tw-5, 25, text='EOT', fill='#666',
-                                    anchor='ne', font=('Consolas', 7))
-            tape_canvas.create_text(tw//2, 3, text=f"{pos_mm:.0f} mm",
-                                    fill=ACCENT, font=('Consolas', 8))
-
-        except Exception:
-            pass
-
-        pkt_lbl.config(text=f"PACKETS: {pkts}")
-
-        # Update files list every 20 frames
-        if pkts % 20 == 0:
+    def bg_loop():
+        """Background: read tape directory, update cache."""
+        while True:
             try:
-                file_listbox.delete(0, tk.END)
-                from tapefs import Directory
-                dir_, err = fs.list_files()
+                d, err = fs.list_files()
                 if not err:
-                    for e in dir_.entries:
-                        file_listbox.insert(tk.END,
-                            f"  {e.filename:<20} {e.file_size:>8} B")
+                    dir_cache[:] = [(x.filename, x.file_size) for x in d.entries]
+                    status['text'] = f'IDLE  ({len(dir_cache)} files)'
+                    status['pct'] = 100
+                else:
+                    status['text'] = f'SCANNING...'
+                    status['pct'] = int(time.monotonic() * 10) % 100
+            except:
+                status['text'] = 'ERROR'
+            time.sleep(5)
+
+    threading.Thread(target=bg_loop, daemon=True).start()
+
+    # ---- FUSE operations (instant, from cache only) ------------- #
+    class TapeFS(fuse.Operations):
+        def getattr(self, path, fh=None):
+            if path == '/':
+                return {'st_mode': 0o755 | 0o40000, 'st_nlink': 2}
+            name = path.lstrip('/')
+            if name == '_tape_status.txt':
+                return {'st_mode': 0o644 | 0o100000, 'st_nlink': 1,
+                        'st_size': len(status['text'])}
+            for fn, sz in dir_cache:
+                if fn == name:
+                    return {'st_mode': 0o644 | 0o100000, 'st_nlink': 1, 'st_size': sz}
+            raise fuse.FuseOSError(errno.ENOENT)
+        def readdir(self, path, fh=None):
+            yield '.'; yield '..'
+            yield '_tape_status.txt'
+            for fn, _ in dir_cache:
+                yield fn
+        def read(self, path, size, offset, fh):
+            name = path.lstrip('/')
+            if name == '_tape_status.txt':
+                return status['text'].encode()[offset:offset+size]
+            d, _ = fs.read_file(name)
+            return (d or b'')[offset:offset+size]
+        def write(self, path, data, offset, fh):
+            name = path.lstrip('/')
+            if name == '_tape_status.txt': return len(data)
+            old, _ = fs.read_file(name)
+            new = (old or b'')[:offset] + data + (old or b'')[offset+len(data):]
+            fs.write_file(name, new)
+            return len(data)
+        def truncate(self, path, length, fh=None):
+            name = path.lstrip('/')
+            old, _ = fs.read_file(name) or b''
+            fs.write_file(name, old[:length])
+            return 0
+        def unlink(self, path):
+            d, e = fs.list_files()
+            if not e: d.remove(path.lstrip('/')); fs.write_directory(d)
+            return 0
+
+    # ---- Start FUSE in background + keep running ------------- #
+    try:
+        os.makedirs(mountpoint, exist_ok=True)
+        abspath = os.path.abspath(mountpoint)
+        print(f"  Mounted at {abspath}")
+        print(f"  cat {abspath}/_tape_status.txt  to see status")
+        
+        def run_fuse():
+            try:
+                fuse.FUSE(TapeFS(), abspath, foreground=True)
             except:
                 pass
-
-        # Schedule next update (~30 FPS)
-        root.after(33, update_status)
-
-    def on_close():
-        global ui_running
-        ui_running = False
-        root.destroy()
-
-    root.protocol("WM_DELETE_WINDOW", on_close)
-
-    # ---- Start FUSE in background thread ------------------------- #
-
-
-    if fuse_available:
-        try:
-            os.makedirs(mountpoint, exist_ok=True)
-            abspath = os.path.abspath(mountpoint)
-            print(f"  Mounting at {abspath}")
-            
-            # FUSE class with directory cache (avoids hitting firmware on every call)
-            _dir_cache = {'entries': [], 'time': 0.0}
-            
-            class TapeFS(fuse.Operations):
-                def _get_dir(self):
-                    if time.monotonic() - _dir_cache['time'] > 2.0:
-                        from tapefs import Directory
-                        d, e = fs.list_files()
-                        if not e:
-                            _dir_cache['entries'] = [(x.filename, x.file_size) for x in d.entries]
-                        _dir_cache['time'] = time.monotonic()
-                    return _dir_cache['entries']
-                def getattr(self, path, fh=None):
-                    if path == '/':
-                        return {'st_mode': 0o755 | 0o40000, 'st_nlink': 2}
-                    name = path.lstrip('/')
-                    for fn, sz in self._get_dir():
-                        if fn == name:
-                            return {'st_mode': 0o644 | 0o100000,
-                                    'st_nlink': 1, 'st_size': sz}
-                    raise fuse.FuseOSError(fuse.ENOENT)
-                def readdir(self, path, fh=None):
-                    yield '.'
-                    yield '..'
-                    for fn, _ in self._get_dir():
-                        yield fn
-                def open(self, path, flags): return 0
-                def read(self, path, size, offset, fh):
-                    d, _ = fs.read_file(path.lstrip('/'))
-                    return (d or b'')[offset:offset+size]
-                def write(self, path, data, offset, fh):
-                    name = path.lstrip('/')
-                    old, _ = fs.read_file(name)
-                    new = (old or b'')[:offset] + data + (old or b'')[offset+len(data):]
-                    fs.write_file(name, new); return len(data)
-                def truncate(self, path, length, fh=None):
-                    name = path.lstrip('/')
-                    old, _ = fs.read_file(name)
-                    fs.write_file(name, (old or b'')[:length]); return 0
-                def unlink(self, path):
-                    from tapefs import Directory
-                    d, e = fs.list_files()
-                    if not e: d.remove(path.lstrip('/')); fs.write_directory(d)
-                    return 0
-            
-            def fuse_runner():
-                try:
-                    fuse.FUSE(TapeFS(), abspath, foreground=True)
-                except Exception as e:
-                    print(f"  FUSE error: {e}")
-            threading.Thread(target=fuse_runner, daemon=True).start()
-        except Exception as e:
-            print(f"  FUSE init failed: {e}")
-    else:
-        print(f"  UI only mode")
-
-    print(f"  Debug window open. Close window to exit.")
-
-    update_waveform()
-    root.after(100, update_status)
-    root.after(50, lambda: root.after(50, update_waveform()))
-
-    # Schedule waveform updates at ~20 FPS
-    def wave_loop():
-        update_waveform()
-        root.after(50, wave_loop)
-    root.after(50, wave_loop)
-
-    try:
-        root.mainloop()
+        threading.Thread(target=run_fuse, daemon=True).start()
+        time.sleep(0.5)
+        
+        # Keep alive until Ctrl+C
+        while True:
+            time.sleep(1)
     except KeyboardInterrupt:
         pass
+    except Exception as e:
+        print(f"  Error: {e}")
     finally:
-        ui_running = False
         fw_stop()
         print("  Unmounted.")
-
-# ---- Main --------------------------------------------------------- #
-if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: tapeworm mount <folder> | format | ls | read | write")
-        sys.exit(1)
-
-    try:
-        cmd = sys.argv[1]; args = sys.argv[2:]
-        if cmd == 'format': cmd_format()
-        elif cmd == 'ls': cmd_ls()
-        elif cmd == 'read': cmd_read(args[0], args[1] if len(args)>1 else None)
-        elif cmd == 'write': cmd_write(args[0], args[1] if len(args)>1 else None)
-        elif cmd == 'mount': cmd_mount(args[0] if args else './tape_mount')
-        else: print(f"Unknown: {cmd}")
-    except KeyboardInterrupt:
-        pass
-    finally:
-        fw_stop()
-        print("\033[?25h\033[H\033[J", end='')
