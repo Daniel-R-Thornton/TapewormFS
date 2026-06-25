@@ -1,47 +1,46 @@
 #include "motor.hpp"
 #include <cmath>
+#include <algorithm>
 
 namespace tapefs { namespace firmware {
 
-void Motor::setSpeed(double targetMMps, int dir) {
-    targetSpeed_ = std::abs(targetMMps);
-    direction_ = dir;
-    if (dir == 0 || targetSpeed_ < 0.1) {
-        targetSpeed_ = 0;
-        direction_ = 0;
-    }
+void Motor::set(MotorDir dir, MotorSpeed speed) {
+    dir_   = dir;
+    speed_ = speed;
+    if (speed == MotorSpeed::kOff) spinUpElapsed_ = 0;
+    else spinUpElapsed_ = 0; // reset spin-up timer
+}
+
+double Motor::currentSpeedMMps() const {
+    if (speed_ == MotorSpeed::kOff) return 0;
+
+    // Spin-up: gradually reach full speed over ~150ms
+    double fraction = std::min(1.0, spinUpElapsed_ / kSpinUpMs);
+    double base = (speed_ == MotorSpeed::kFast) ? kFastSpeedMMps : kPlaySpeedMMps;
+    return base * fraction;
+}
+
+double Motor::effectiveSpeed() const {
+    double nominal = currentSpeedMMps();
+    double flutter = (2.0 / 100.0) * std::sin(wowPhase_)
+                   + (0.8 / 100.0) * std::sin(flutterPhase_);
+    return nominal * (1.0 + flutter);
 }
 
 void Motor::tick(double dt) {
-    if (direction_ == 0) {
-        if (currentSpeed_ > 0) {
-            currentSpeed_ -= 8000.0 * dt;
-            if (currentSpeed_ < 0) currentSpeed_ = 0;
-        }
-        wowFlutter_ = 0;
-        return;
+    if (speed_ != MotorSpeed::kOff) {
+        spinUpElapsed_ += dt * 1000.0; // convert to ms
     }
 
-    double diff = targetSpeed_ - currentSpeed_;
-    if (std::abs(diff) < 0.5) {
-        currentSpeed_ = targetSpeed_;
-    } else if (diff > 0) {
-        currentSpeed_ += 5000.0 * dt;
-        if (currentSpeed_ > targetSpeed_) currentSpeed_ = targetSpeed_;
-    } else {
-        currentSpeed_ -= 8000.0 * dt;
-        if (currentSpeed_ < targetSpeed_) currentSpeed_ = targetSpeed_;
-    }
-
+    // Wow/flutter phase
     wowPhase_     += 2.0 * M_PI * 0.5 * dt;
     flutterPhase_ += 2.0 * M_PI * 4.0 * dt;
-    wowFlutter_ = (2.0 / 100.0) * std::sin(wowPhase_)
-                + (0.8 / 100.0) * std::sin(flutterPhase_);
 
-    double eff = currentSpeed_ * (1.0 + wowFlutter_);
-    if (direction_ < 0) eff = -eff;
-    positionMM_ += eff * dt;
-    if (positionMM_ < 0) positionMM_ = 0;
+    // Update position
+    double eff = effectiveSpeed();
+    if (dir_ == MotorDir::kReverse) eff = -eff;
+    posMm_ += eff * dt * (speed_ != MotorSpeed::kOff ? 1.0 : 0.0);
+    if (posMm_ < 0) posMm_ = 0;
 }
 
 }} // namespace

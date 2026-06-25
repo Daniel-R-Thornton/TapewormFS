@@ -1,41 +1,55 @@
 #pragma once
-#include <cmath>
+/**
+ * Motor — 3-wire cassette deck motor.
+ *
+ * Real hardware: just FORWARD, REVERSE, FAST, OFF.
+ * No PWM, no acceleration ramps.  Snap to speed or stop.
+ * Wow/flutter still happens (mechanical tape system).
+ */
 
 namespace tapefs { namespace firmware {
 
-struct MotorConfig {
-    double accelerationMMps2  = 5000.0;
-    double decelerationMMps2 = 8000.0;
-    double wowDepthPct       = 2.0;
-    double wowFreqHz         = 0.5;
-    double flutterDepthPct   = 0.8;
-    double flutterFreqHz     = 4.0;
-};
+enum class MotorSpeed { kOff, kPlay, kFast };
+enum class MotorDir   { kForward = 1, kReverse = -1 };
 
 class Motor {
 public:
-    static constexpr double kPlaySpeedMMps  = 47.6;
-    static constexpr double kFastSpeedMMps  = 476.0;
+    static constexpr double kPlaySpeedMMps = 47.6;   // standard cassette
+    static constexpr double kFastSpeedMMps = 476.0;  // 10× for FF/rewind
+    static constexpr double kSpinUpMs      = 150.0;  // ms to reach speed
 
-    explicit Motor(MotorConfig cfg = {}) : cfg_(cfg) {}
+    Motor() = default;
 
-    void setSpeed(double targetMMps, int dir);
-    void play()        { setSpeed(kPlaySpeedMMps, 1); }
-    void fastForward() { setSpeed(kFastSpeedMMps, 1); }
-    void rewind()      { setSpeed(kFastSpeedMMps, -1); }
-    void stop()        { setSpeed(0, 0); }
+    /// Set direction and speed.  Simple 3-wire control.
+    void set(MotorDir dir, MotorSpeed speed);
+
+    void play()       { set(MotorDir::kForward, MotorSpeed::kPlay); }
+    void fastForward(){ set(MotorDir::kForward, MotorSpeed::kFast); }
+    void rewind()    { set(MotorDir::kReverse, MotorSpeed::kPlay); }
+    void fastRev()    { set(MotorDir::kReverse, MotorSpeed::kFast); }
+    void stop()       { set(MotorDir::kForward, MotorSpeed::kOff); }
+
+    /// Advance by dt seconds.  Updates position (mm from BOT).
     void tick(double dt);
 
-    double currentSpeedMMps()  const { return currentSpeed_; }
-    double currentPositionMM() const { return positionMM_; }
-    bool   isMoving() const { return direction_ != 0 && currentSpeed_ > 0.5; }
-    double effectiveSpeedMMps() const { return currentSpeed_ * (1.0 + wowFlutter_); }
+    // ---- queries ------------------------------------------------- //
+
+    double currentSpeedMMps() const;
+    double positionMM()  const { return posMm_; }
+    bool   isMoving()    const { return speed_ != MotorSpeed::kOff; }
+    double effectiveSpeed() const;
 
 private:
-    MotorConfig cfg_;
-    double targetSpeed_ = 0, currentSpeed_ = 0, positionMM_ = 0;
-    int direction_ = 0;
-    double wowPhase_ = 0, flutterPhase_ = 0, wowFlutter_ = 0;
+    MotorSpeed speed_ = MotorSpeed::kOff;
+    MotorDir   dir_   = MotorDir::kForward;
+    double     posMm_ = 0;
+
+    // Spinning state: real motor takes ~150ms to reach speed
+    double spinUpElapsed_ = 0;
+
+    // Wow/flutter state
+    double wowPhase_     = 0;
+    double flutterPhase_ = 0;
 };
 
-}}
+}} // namespace
