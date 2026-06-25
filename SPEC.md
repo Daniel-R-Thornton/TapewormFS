@@ -33,7 +33,7 @@ Store digital files on standard audio cassette tapes.
 |-------|------|------|
 | **host-driver** | Rust / C (FUSE) | Presents tape as sequential file system to OS |
 | **debug-suite** | TypeScript / Vite | Web-based waveform debugger & visualiser |
-| **firmware** | C / ESP-IDF / Pico SDK | Bit-level encode/decode to audio via I2C (MCP4725 DAC) |
+| **firmware** | C / ESP-IDF / Pico SDK | Bit-level encode/decode: I2C (MCP4725) for output, I2S (PCM1808 / INMP441) for input |
 | **filesystem** | Rust / C | Block allocation, error recovery, directory structure |
 
 ---
@@ -55,7 +55,7 @@ User file  →  host-driver  →  /tmp buffer  →  filesystem layer
 ### 2.2 Read Path
 
 ```
-Cassette LINE OUT → firmware (ADC) → modem decode
+Cassette LINE OUT → firmware (I2S ADC) → modem decode
       ↓
   raw blocks with error flags
       ↓
@@ -489,7 +489,37 @@ For a 200 baud modem with 1024 samples/frame, sample rate of ~8 kHz is sufficien
 
 **Output conditioning:** Place a 10 µF electrolytic + 100 nF ceramic capacitor between VOUT and GND to smooth the DAC output. A 1 kΩ resistor in series with the output limits current to the cassette deck's LINE IN.
 
-**ADC for read-back:** Cassette LINE OUT → voltage divider (to drop cassette output to 3.3 V range) → MCU ADC pin. ESP32's built-in ADC (2× 12-bit, ~6 kHz usable) is sufficient for low baud rates. For better quality, an external I2C ADC (e.g. ADS1115, 16-bit, up to 860 Hz) or I2S ADC (e.g. PCM1808) can be added.
+**ADC for read-back (I2S):** Cassette LINE OUT → input conditioning → I2S ADC → MCU.
+
+| ADC Chip | Bus | Bits | Sample Rate | Notes |
+|----------|-----|------|-------------|-------|
+| **PCM1808** | I2S | 24-bit | up to 96 kHz | Stereo, differential inputs, good SNR (99 dB). Primary choice. |
+| **INMP441** | I2S | 24-bit | up to 44.1 kHz | MEMS microphone — not line-level. Needs pre-amp mod. Avoid unless prototyping. |
+| ESP32 built-in ADC | — | 12-bit | ~6 kHz usable | Works for testing low baud rates only. Noisy. |
+
+**PCM1808 wiring:**
+
+| PCM1808 Pin | Connect To |
+|-------------|------------|
+| VIN (1) | 3.3 V |
+| GND (2) | GND |
+| BCK (3) | MCU I2S bit clock (BCLK) |
+| DOUT (4) | MCU I2S data in (DIN) |
+| LRCK (5) | MCU I2S word select (LRCK/WS) |
+| SCKI (6) | GND (internal clock, no external needed) |
+| VREFL (7) | GND (analog ref low) |
+| VREFR (8) | GND |
+| VINL1+ (9) | Cassette LINE OUT (left channel, via DC-block cap) |
+| VINL1- (10) | GND |
+| VINR1+ (11) | Cassette LINE OUT (right channel, via DC-block cap) |
+| VINR1- (12) | GND |
+| FMT0 (13) | GND (I2S format) |
+| FMT1 (14) | GND |
+
+**Input conditioning** (between cassette LINE OUT and PCM1808):
+- 1 µF DC-blocking capacitor in series
+- 10 kΩ pulldown to GND after the cap
+- Optional: 100 Ω resistor + 100 pF cap as low-pass filter (~16 kHz cutoff)
 
 ---
 
@@ -650,7 +680,7 @@ A simple TCP server (port 9725) that speaks a text protocol for systems that can
 
 ### Phase 4 — Firmware (ESP32)
 - [ ] I2C output to MCP4725 DAC (audio generation via timer ISR)
-- [ ] ADC input (audio capture from cassette LINE OUT via MCU ADC or external)
+- [ ] I2S input from PCM1808 ADC (audio capture from cassette LINE OUT)
 - [ ] Real-time encode (Basic / FrequencyPulse)
 - [ ] Real-time decode (sync detection, frame correlation)
 - [ ] Motor control (relay / MOSFET)
