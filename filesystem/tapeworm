@@ -141,8 +141,14 @@ def recv(e, t=5.0):
         buf = b''
     return None
 
-def wb(block_bytes):
-    send(0x05, block_bytes)
+def wb(block):
+    """Write a RawBlock to the firmware."""
+    from tapefs import RawBlock
+    if isinstance(block, RawBlock):
+        data = block.bytes
+    else:
+        data = block
+    send(0x05, data)
     r = recv(0x85)
     if r and r[0] == 0x00:
         send(0x07); recv(0x87)
