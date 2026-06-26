@@ -185,10 +185,12 @@ def cmd_write(local, tapename=None):
     fw_stop()
 
 def cmd_mount(mountpoint):
-    """Mount FUSE folder with live status file + background cache."""
+    """Mount FUSE folder with live status file + debug UI."""
+    print("  Starting firmware...", flush=True)
     import fuse
 
     fw_start()
+    print("  Setting up filesystem...", flush=True)
     from tapefs import Filesystem, RawBlock, Directory
     fs = Filesystem(wb, lambda: RawBlock(bytes=rb()) if rb() else None, sk)
 
@@ -263,7 +265,7 @@ def cmd_mount(mountpoint):
         
         def run_fuse():
             try:
-                fuse.FUSE(TapeFS(), abspath, foreground=True)
+                fuse.FUSE(TapeFS(), abspath, foreground=True, nonempty=True)
             except:
                 pass
         threading.Thread(target=run_fuse, daemon=True).start()
@@ -358,3 +360,21 @@ def cmd_mount(mountpoint):
     finally:
         fw_stop()
         print("  Unmounted.")
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("Usage: tapeworm mount <folder> | format | ls | read | write")
+        sys.exit(1)
+
+    try:
+        cmd = sys.argv[1]; args = sys.argv[2:]
+        if cmd == 'format': cmd_format()
+        elif cmd == 'ls': cmd_ls()
+        elif cmd == 'read': cmd_read(args[0], args[1] if len(args)>1 else None)
+        elif cmd == 'write': cmd_write(args[0], args[1] if len(args)>1 else None)
+        elif cmd == 'mount': cmd_mount(args[0] if args else './tape_mount')
+        else: print(f"Unknown: {cmd}")
+    except KeyboardInterrupt:
+        pass
+    finally:
+        fw_stop()
