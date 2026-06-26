@@ -446,6 +446,7 @@ def cmd_mount(mountpoint):
             wave_canvas.create_line(0,mid,cw,mid,fill='#2a4a6c',width=1)
             
             samples = read_wave()
+            log(f'WAVE: {len(samples)} samples')
             if len(samples)>1:
                 step = max(1, len(samples)//cw)
                 pts = []
