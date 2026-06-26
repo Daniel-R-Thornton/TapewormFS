@@ -119,11 +119,22 @@ def wb(block_bytes):
         return True
     return False
 
+def rb_fast(timeout=3.0):
+    send(0x06)
+    r = recv(0x86, timeout)
+    if r and len(r) > 5: return r[0:1] + r[1:-4]
+    return None
+
 def rb():
     send(0x06)
     r = recv(0x86, 120.0)
     if r and len(r) > 5: return r[0:1] + r[1:-4]
     return None
+
+def sk_fast(n, timeout=2.0):
+    p = st.pack("<III", n, 0, n*1000) + bytes([0, 255])
+    send(0x03, p); r = recv(0x83, timeout)
+    return r and r[0] == 0x00
 
 def sk(n):
     p = st.pack('<III', n, 0, n*1000) + bytes([0, 255])
@@ -165,8 +176,8 @@ def cmd_ls():
 
 def cmd_read(name, out=None):
     from tapefs import Filesystem, RawBlock
-    fs = Filesystem(wb, lambda: RawBlock(bytes=rb()) if rb() else None, sk)
-    data, err = fs.read_file(name)
+    fs_mount = Filesystem(wb, lambda: RawBlock(bytes=rb_fast()) if rb_fast() else None, lambda n: sk_fast(n))
+    data, err = fs_mount.read_file(name)
     if err: return print(f"  '{name}' not found")
     if out:
         with open(out, 'wb') as f: f.write(data)
@@ -178,8 +189,8 @@ def cmd_write(local, tapename=None):
     tapename = tapename or os.path.basename(local)
     with open(local, 'rb') as f: data = f.read()
     from tapefs import Filesystem, RawBlock
-    fs = Filesystem(wb, lambda: RawBlock(bytes=rb()) if rb() else None, sk)
-    err = fs.write_file(tapename, data)
+    fs_mount = Filesystem(wb, lambda: RawBlock(bytes=rb_fast()) if rb_fast() else None, lambda n: sk_fast(n))
+    err = fs_mount.write_file(tapename, data)
     if err: return print(f"  Write failed: {err}")
     print(f"  Wrote '{tapename}' ({len(data)} B)")
     fw_stop()
@@ -192,7 +203,7 @@ def cmd_mount(mountpoint):
     fw_start()
     print("  Setting up filesystem...", flush=True)
     from tapefs import Filesystem, RawBlock, Directory
-    fs = Filesystem(wb, lambda: RawBlock(bytes=rb()) if rb() else None, sk)
+    fs_mount = Filesystem(wb, lambda: RawBlock(bytes=rb_fast()) if rb_fast() else None, lambda n: sk_fast(n))
 
     # ---- Status + directory cache + pending writes ------------ #
     status = {'text': 'LOADING...'}
@@ -204,13 +215,13 @@ def cmd_mount(mountpoint):
         while True:
             try:
                 # Read current tape directory
-                d, err = fs.list_files()
+                d, err = fs_mount.list_files()
                 if not err:
                     dir_cache[:] = [(x.filename, x.file_size) for x in d.entries]
                 
                 # Flush pending writes to tape
                 for name, data in list(pending.items()):
-                    err = fs.write_file(name, data)
+                    err = fs_mount.write_file(name, data)
                     if not err:
                         dir_cache.append((name, len(data)))
                         del pending[name]
@@ -251,14 +262,14 @@ def cmd_mount(mountpoint):
             return status['text'].encode()
         if name in pending:
             return pending[name]
-        d, _ = fs.read_file(name)
+        d, _ = fs_mount.read_file(name)
         return d or b''
         """Return file data from pending cache or tape."""
         if name == '_tape_status.txt':
             return status['text'].encode()
         if name in pending:
             return pending[name]
-        d, _ = fs.read_file(name)
+        d, _ = fs_mount.read_file(name)
         return d or b''
 
     # ---- FUSE operations (instant, from cache + pending) ------ #
@@ -303,10 +314,10 @@ def cmd_mount(mountpoint):
         def unlink(self, path):
             name = path.lstrip('/')
             pending.pop(name, None)
-            d, e = fs.list_files()
+            d, e = fs_mount.list_files()
             if not e:
                 d.remove(name)
-                fs.write_directory(d)
+                fs_mount.write_directory(d)
             return 0
 
     # ---- Start FUSE in background ----------------------------- #
