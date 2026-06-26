@@ -266,7 +266,11 @@ def cmd_mount(mountpoint):
                     status['text'] = f'IDLE  ({len(dir_cache)} files)'
                     log(f'SYNC idle: {len(dir_cache)} files, {len(pending)} pending')
             except Exception as e:
+                import traceback
+                import sys
+                tb = traceback.format_exc()
                 status['text'] = f'ERROR: {e}'
+                log(f'SYNC error: {e}', tb)
             time.sleep(5)
 
     threading.Thread(target=sync_pending, daemon=True).start()
