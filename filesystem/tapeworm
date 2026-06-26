@@ -194,67 +194,119 @@ def cmd_mount(mountpoint):
     from tapefs import Filesystem, RawBlock, Directory
     fs = Filesystem(wb, lambda: RawBlock(bytes=rb()) if rb() else None, sk)
 
-    # ---- Status + directory cache (never blocks FUSE) ---------- #
-    status = {'text': 'LOADING...', 'pct': 0}
-    dir_cache = []
+    # ---- Status + directory cache + pending writes ------------ #
+    status = {'text': 'LOADING...'}
+    dir_cache = []        # from tape: [(name, size)]
+    pending = {}          # written but not synced: {name: bytes}
 
-    def bg_loop():
-        """Background: read tape directory, update cache."""
+    def sync_pending():
+        """Background: write pending files to tape, update dir cache."""
         while True:
             try:
+                # Read current tape directory
                 d, err = fs.list_files()
                 if not err:
                     dir_cache[:] = [(x.filename, x.file_size) for x in d.entries]
+                
+                # Flush pending writes to tape
+                for name, data in list(pending.items()):
+                    err = fs.write_file(name, data)
+                    if not err:
+                        dir_cache.append((name, len(data)))
+                        del pending[name]
+                        status['text'] = f'SYNCED {name}'
+                    else:
+                        status['text'] = f'ERROR syncing {name}'
+                
+                if not pending:
                     status['text'] = f'IDLE  ({len(dir_cache)} files)'
-                    status['pct'] = 100
-                else:
-                    status['text'] = f'SCANNING...'
-                    status['pct'] = int(time.monotonic() * 10) % 100
-            except:
-                status['text'] = 'ERROR'
+            except Exception as e:
+                status['text'] = f'ERROR: {e}'
             time.sleep(5)
 
-    threading.Thread(target=bg_loop, daemon=True).start()
+    threading.Thread(target=sync_pending, daemon=True).start()
 
-    # ---- FUSE operations (instant, from cache only) ------------- #
+    # ---- Combine tape + pending for FUSE lookups -------------- #
+    def all_files():
+        """Return list of (name, size) from both tape and pending."""
+        seen = set()
+        result = []
+        result.append(('_tape_status.txt', len(status['text'])))
+        seen.add('_tape_status.txt')
+        for name, data in pending.items():
+            result.append((name, len(data)))
+            seen.add(name)
+        for fn, sz in dir_cache:
+            if fn not in seen:
+                result.append((fn, sz))
+                seen.add(fn)
+        return result
+
+    def exists(name):
+        return any(fn == name for fn, _ in all_files())
+
+    def get_data(name):
+        """Return file data from pending cache or tape."""
+        if name == '_tape_status.txt':
+            return status['text'].encode()
+        if name in pending:
+            return pending[name]
+        d, _ = fs.read_file(name)
+        return d or b''
+        """Return file data from pending cache or tape."""
+        if name == '_tape_status.txt':
+            return status['text'].encode()
+        if name in pending:
+            return pending[name]
+        d, _ = fs.read_file(name)
+        return d or b''
+
+    # ---- FUSE operations (instant, from cache + pending) ------ #
     class TapeFS(fuse.Operations):
         def getattr(self, path, fh=None):
             if path == '/':
                 return {'st_mode': 0o755 | 0o40000, 'st_nlink': 2}
             name = path.lstrip('/')
-            if name == '_tape_status.txt':
-                return {'st_mode': 0o644 | 0o100000, 'st_nlink': 1,
-                        'st_size': len(status['text'])}
-            for fn, sz in dir_cache:
+            for fn, sz in all_files():
                 if fn == name:
                     return {'st_mode': 0o644 | 0o100000, 'st_nlink': 1, 'st_size': sz}
             raise fuse.FuseOSError(errno.ENOENT)
         def readdir(self, path, fh=None):
             yield '.'; yield '..'
-            yield '_tape_status.txt'
-            for fn, _ in dir_cache:
+            for fn, _ in all_files():
                 yield fn
         def read(self, path, size, offset, fh):
+            data = get_data(path.lstrip('/'))
+            return data[offset:offset+size]
+        def create(self, path, mode, **kw):
             name = path.lstrip('/')
-            if name == '_tape_status.txt':
-                return status['text'].encode()[offset:offset+size]
-            d, _ = fs.read_file(name)
-            return (d or b'')[offset:offset+size]
-        def write(self, path, data, offset, fh):
+            if name not in pending:
+                pending[name] = b''
+            return 0
+        def open(self, path, *a):
+            name = path.lstrip('/')
+            # Create file in pending if doesn't exist
+            if name not in pending and name not in [fn for fn,_ in all_files()]:
+                pending[name] = b''
+            return 0
             name = path.lstrip('/')
             if name == '_tape_status.txt': return len(data)
-            old, _ = fs.read_file(name)
-            new = (old or b'')[:offset] + data + (old or b'')[offset+len(data):]
-            fs.write_file(name, new)
+            old = pending.get(name, get_data(name))
+            new = old[:offset] + data + old[offset+len(data):]
+            pending[name] = new
             return len(data)
         def truncate(self, path, length, fh=None):
             name = path.lstrip('/')
-            old, _ = fs.read_file(name) or b''
-            fs.write_file(name, old[:length])
+            old = pending.get(name, get_data(name))
+            pending[name] = old[:length]
             return 0
         def unlink(self, path):
+            name = path.lstrip('/')
+            pending.pop(name, None)
             d, e = fs.list_files()
-            if not e: d.remove(path.lstrip('/')); fs.write_directory(d)
+            if not e:
+                d.remove(name)
+                fs.write_directory(d)
             return 0
 
     # ---- Start FUSE in background ----------------------------- #
