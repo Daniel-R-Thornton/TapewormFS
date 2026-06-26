@@ -1,66 +1,61 @@
 #pragma once
 /**
- * FSK Demodulator — same code runs on ESP32 and in simulation.
+ * ModemDecoder — FSK decoder driven by timer ISR.
  *
- * Reads audio via hal::adcReadFloat().
- * Outputs decoded bytes via callback.
+ * Real ESP32 usage:
+ *   decoder.startDecoding();
+ *   // timer ISR at 3200 Hz: decoder.feedSample(hal::adcReadFloat())
+ *   // when frameReady(), take the data
  */
 
 #include <cstdint>
 #include <vector>
 #include <functional>
-#include <cmath>
 
 namespace tapefs { namespace firmware {
 
 class ModemDecoder {
 public:
-    using DataCallback = std::function<void(const std::vector<uint8_t>&)>;
+    ModemDecoder() : ModemDecoder(Config{}) {}
+    using FrameCallback = std::function<void(const std::vector<uint8_t>&)>;
 
     struct Config {
-        int   sampleRate      = 3200;
-        int   symbolsPerSec   = 50;
-        double pilotFreqHz    = 62.5;
+        int    sampleRate    = 3200;
+        int    symbolsPerSec = 50;
+        double pilotFreqHz   = 62.5;
     };
 
-    ModemDecoder() : ModemDecoder(Config{}) {}
     explicit ModemDecoder(Config cfg) : cfg_(cfg) {}
 
-    /// Feed one sample (call this from the ADC timer ISR).
+    /// Start listening for frames.
+    void startDecoding();
+
+    /// Call from timer ISR: feed one ADC sample.
     void feedSample(float sample);
 
-    /// Set a callback for decoded data frames.
-    void setDataCallback(DataCallback cb) { onData_ = std::move(cb); }
+    bool isFrameReady() const { return frameReady_; }
+    std::vector<uint8_t> takeFrame();
 
-    /// Decode a buffer of samples (for file-based use).
-    /// Returns decoded bytes.
-    std::vector<uint8_t> decode(const std::vector<float>& samples);
+    void onFrame(FrameCallback cb) { onFrame_ = std::move(cb); }
 
 private:
     Config cfg_;
-    DataCallback onData_;
+    FrameCallback onFrame_;
+
     std::vector<float> buf_;
-    int samplesPerSymbol_ = 64;
-    int guardSamples_ = 6;
+    int sps_ = 64;
+    int guard_ = 6;
 
-    // Decoder state
     std::vector<int> symbols_;
-    int symbolCount_ = 0;
+    int consecutiveZeros_ = 0;
     bool inFrame_ = false;
-    int syncCount_ = 0;
+    int dataSymbols_ = 0;
+    bool frameReady_ = false;
+    std::vector<uint8_t> frameData_;
 
-    // Tone detection
-    int detectTone(const std::vector<float>& window);
-
-    // Pilot tracking
-    double pilotPhase_ = 0;
-    double lastSample_ = 0;
-    int zeroCrossCount_ = 0;
-
-    std::vector<uint8_t> decodedBytes_;
-
-    // Tone frequencies (same as encoder)
-    static constexpr double kTones_[8] = {400, 600, 800, 1000, 1150, 1300, 1450, 1550};
+    int detectTone(const float* samples, int n);
+    void emitFrame();
+    void reset();
 };
 
-}} // namespace tapefs::firmware
+}} // namespace

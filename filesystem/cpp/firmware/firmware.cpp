@@ -7,10 +7,40 @@
 #include <thread>
 #include <chrono>
 #include <cmath>
+#include <cstdarg>
 
 namespace tapefs { namespace firmware {
 
-// ---- Packet protocol ---------------------------------------------- //
+// ---- Firmware-side debug log ------------------------------------ #
+static FILE* fw_log = nullptr;
+static void fw_log_init() {
+    if (!fw_log) {
+        fw_log = fopen("/tmp/tapewormfs_fw.log", "a");
+        if (fw_log) {
+            auto now = std::chrono::system_clock::now();
+            auto t = std::chrono::system_clock::to_time_t(now);
+            char buf[64];
+            std::strftime(buf, sizeof(buf), "%H:%M:%S", std::localtime(&t));
+            fprintf(fw_log, "\n=== Firmware %s ===\n", buf);
+            fflush(fw_log);
+        }
+    }
+}
+
+static void fw_log_cmd(const char* fmt, ...) {
+    fw_log_init();
+    if (!fw_log) return;
+    va_list args;
+    va_start(args, fmt);
+    auto now = std::chrono::steady_clock::now();
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        now.time_since_epoch()).count();
+    fprintf(fw_log, "[%lld.%03lld] FW: ", (long long)(ms/1000), (long long)(ms%1000));
+    vfprintf(fw_log, fmt, args);
+    fprintf(fw_log, "\n");
+    fflush(fw_log);
+    va_end(args);
+}
 
 static constexpr uint8_t kStart = 0xFE, kEsc = 0xFD;
 
@@ -69,22 +99,26 @@ std::vector<uint8_t> Firmware::nak(uint8_t code) { return respond(0xFF, {code});
 // These use TapeDeck for realistic motor/seek timing.
 
 std::vector<uint8_t> Firmware::handlePing() {
+    fw_log_cmd("PING");
     return respond(0x81, {'T','a','p','e','w','o','r','m','F','S',' ','v','1','.','0','\0'});
 }
 
 std::vector<uint8_t> Firmware::handleWriteBlock(const std::vector<uint8_t>& p) {
+    fw_log_cmd("WRITE_BLOCK len=%zu", p.size());
     if (p.empty()) return nak(0x04);
     writeBuffer_.push_back(p);
     return respond(0x85, {0x00});
 }
 
 std::vector<uint8_t> Firmware::handleFlush() {
+    fw_log_cmd("FLUSH buffer=%zu", writeBuffer_.size());
     for (const auto& data : writeBuffer_) recordBlock(data);
     writeBuffer_.clear();
     return respond(0x87, {0x00});
 }
 
 std::vector<uint8_t> Firmware::handleReadNext() {
+    fw_log_cmd("READ_NEXT");
     auto data = playbackBlock();
     if (data.empty()) return nak(0x07);
 
@@ -101,6 +135,9 @@ std::vector<uint8_t> Firmware::handleReadNext() {
 }
 
 std::vector<uint8_t> Firmware::handleSeek(const std::vector<uint8_t>& p) {
+    uint32_t bn = 0;
+    if (p.size() >= 4) for (int i=0;i<4;i++) bn |= (uint32_t)p[i]<<(i*8);
+    fw_log_cmd("SEEK block=%u", bn);
     if (p.size() < 4) return nak(0x04);
     uint32_t blockNo = 0;
     for (int i = 0; i < 4; i++) blockNo |= static_cast<uint32_t>(p[i]) << (i*8);
@@ -139,6 +176,7 @@ std::vector<uint8_t> Firmware::processCommand(const std::vector<uint8_t>& packet
     if (crc16(cd) != sc) return nak(0x03);
     auto payload = std::vector<uint8_t>(inner.begin()+3, inner.begin()+3+length-3);
 
+    fw_log_cmd("CMD 0x%02x payload=%zu", cmdId, payload.size());
     switch (cmdId) {
         case 0x01: return handlePing();
         case 0x03: return handleSeek(payload);
@@ -184,7 +222,7 @@ void Firmware::run() {
 // In simulation, we just call it in a tight loop (same logic).
 
 void Firmware::recordBlock(const std::vector<uint8_t>& data) {
-    fprintf(stderr, "[Record] %zu bytes\n", data.size());
+    fw_log_cmd("RECORD %zu bytes", data.size());
     hal::dacSetOutputFile("/tmp/tapewormfs_raw.tape");
     encoder_.startEncoding(data);
     while (encoder_.isEncoding()) {
@@ -194,6 +232,7 @@ void Firmware::recordBlock(const std::vector<uint8_t>& data) {
 
 std::vector<uint8_t> Firmware::playbackBlock() {
     tape_.load();
+    fw_log_cmd("PLAYBACK samples=%zu", tape_.sampleCount());
     if (tape_.sampleCount() == 0) return {};
     hal::adcSetSource(tape_.allSamples());
 

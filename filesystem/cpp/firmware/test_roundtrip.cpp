@@ -41,7 +41,8 @@ void test_encode_decode_roundtrip() {
 
     // Encode — same call that runs on ESP32 timer ISR
     ModemEncoder encoder;
-    encoder.encode(testData);
+    encoder.startEncoding(testData);
+    while (encoder.isEncoding()) encoder.generateSample();
 
     // Get the raw audio samples
     auto& samples = hal::dacGetOutput();
@@ -51,7 +52,9 @@ void test_encode_decode_roundtrip() {
 
     // Decode — same call that runs on ESP32
     ModemDecoder decoder;
-    auto result = decoder.decode(samples);
+    decoder.startDecoding();
+    for (auto s : samples) decoder.feedSample(s);
+    auto result = decoder.takeFrame();
 
     if (result.empty()) { FAIL("no decoded data"); return; }
     if (result != testData) {

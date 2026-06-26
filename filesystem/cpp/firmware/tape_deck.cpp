@@ -21,7 +21,7 @@ void TapeDeck::seekToBlock(int blockNo) {
     seekStartUs_ = std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
 
-    if (toMM > fromMM) motor_.fastForward(); else motor_.rewind();
+    if (toMM > fromMM) motor_.fastForward(); else motor_.fastRev();
     state_ = 1; // kSeeking
 }
 

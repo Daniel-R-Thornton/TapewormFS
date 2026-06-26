@@ -15,7 +15,7 @@ public:
     explicit TapeHead(TapeHeadConfig cfg = {}) : cfg_(cfg) {}
 
     void attachMotor(Motor* m) { motor_ = m; }
-    double positionMM() const { return motor_ ? motor_->currentPositionMM() : 0; }
+    double positionMM() const { return motor_ ? motor_->positionMM() : 0; }
     int currentBlock() const;
     double blockToMM(int blockNo) const { return cfg_.leaderLengthMM + blockNo * cfg_.blockSpacingMM; }
     double travelTimeMs(double fromMM, double toMM) const;

@@ -1,69 +1,62 @@
 #pragma once
 /**
- * FSK Modem — same code runs on ESP32 and in simulation.
+ * ModemEncoder — FSK encoder driven by timer ISR.
  *
- * The only hardware it touches is:
- *   hal::dacWriteFloat(sample)  — output audio
- *   hal::adcReadFloat(pin)      — input audio
- *   hal::timerStart()           — sample timing
- *
- * Swap the HAL implementation and it runs on real hardware.
+ * Real ESP32 usage:
+ *   encoder.startEncoding(myData);
+ *   // timer ISR at 3200 Hz calls encoder.generateSample()
+ *   // which calls hal::dacWriteFloat() internally
  */
 
 #include <cstdint>
 #include <vector>
 #include <functional>
-#include <cmath>
 
 namespace tapefs { namespace firmware {
 
 class ModemEncoder {
 public:
+    ModemEncoder() : ModemEncoder(Config{}) {}
+    using DoneCallback = std::function<void()>;
+
     struct Config {
-        int   sampleRate      = 3200;
-        int   symbolsPerSec   = 50;
+        int    sampleRate     = 3200;
+        int    symbolsPerSec  = 50;
         double pilotFreqHz    = 62.5;
         double pilotAmplitude = 0.15;
-        int   syncSymbols     = 4;
+        int    syncSymbols    = 4;
     };
 
-    ModemEncoder() : ModemEncoder(Config{}) {}
     explicit ModemEncoder(Config cfg) : cfg_(cfg) {}
 
-    /// Encode bytes → audio samples via hal::dacWriteFloat().
-    /// This is the function that runs on the ESP32 timer ISR.
-    void encode(const std::vector<uint8_t>& data);
-
-    /// Generate one sample (call from timer ISR at sample rate).
-    /// Returns false until encoding is complete.
-    bool generateSample();
-
-    /// Start encoding (call this, then let the timer call generateSample)
+    /// Set up encoding state.  Start the timer after this.
     void startEncoding(const std::vector<uint8_t>& data);
 
-    bool isEncoding() const { return encoding_; }
+    /// Call from timer ISR.  Generates one sample → DAC.
+    /// Returns true while encoding is active.
+    bool generateSample();
+
+    bool isEncoding() const { return phase_ != Phase::kDone; }
+
+    void onDone(DoneCallback cb) { onDone_ = std::move(cb); }
 
 private:
     Config cfg_;
-    bool encoding_ = false;
+    DoneCallback onDone_;
 
-    // Encoder state machine
-    enum class Phase { kPilot, kSync, kData, kGuard, kDone };
+    enum class Phase { kLeader, kSync, kData, kGuard, kDone };
     Phase phase_ = Phase::kDone;
     int samplesInPhase_ = 0;
-    int samplesPerSymbol_;
-    int guardSamples_;
-
-    // Bitstream
-    std::vector<int> symbols_;
+    int sps_ = 64;
+    int guard_ = 6;
+    double pilotPhase_ = 0;
     int symbolIndex_ = 0;
 
-    // Pilot
-    double pilotPhase_ = 0;
+    std::vector<int> symbols_;
 
     float pilotSample();
-    void outputSample(float toneFreq = 0);
-    int bitsPerSymbol() const { return 3; }
+    float toneSample(double freqHz);
+    void  advancePhase();
 };
 
-}} // namespace tapefs::firmware
+}} // namespace
