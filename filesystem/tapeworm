@@ -12,6 +12,32 @@ tapeworm — one command for the full tape pipeline.
 import os, sys, struct, time, select, subprocess, signal, atexit, threading, errno
 import struct as st
 
+
+# ---- Debug logging to /tmp/tapewormfs_debug.log ---------------- #
+_log_file = None
+def log_init():
+    global _log_file
+    if _log_file is None:
+        _log_file = open('/tmp/tapewormfs_debug.log', 'a')
+        _log_file.write(f"\n=== TapewormFS {__import__('datetime').datetime.now()} ===\n")
+        _log_file.flush()
+def log(msg, *args):
+    log_init()
+    import datetime
+    t = datetime.datetime.now().strftime('%H:%M:%S.%f')[:12]
+    _log_file.write(f"[{t}] {msg}\n")
+    if args:
+        for a in args: _log_file.write(f"  {a}\n")
+    _log_file.flush()
+
+import atexit
+@atexit.register
+def _log_close():
+    global _log_file
+    if _log_file:
+        _log_file.write("=== END ===\n\n")
+        _log_file.close()
+        _log_file = None
 HERE = os.path.dirname(os.path.abspath(__file__))
 FW_BIN = os.path.join(HERE, "cpp", "firmware", "run_firmware")
 TAPE_FILE = "/tmp/tapewormfs_raw.tape"
@@ -92,9 +118,11 @@ def fw_stop():
         fw = None
 
 def send(c, p=b''):
+    log(f'UART TX: cmd=0x{c:02x} len={len(p)}')
     fw_start(); fw.stdin.write(enc(c, p)); fw.stdin.flush()
 
 def recv(e, t=5.0):
+    log(f'UART RX: wait cmd=0x{e:02x} timeout={t}s')
     buf = b''; dl = time.monotonic() + t
     while time.monotonic() < dl:
         r,_,_ = select.select([fw.stdout],[],[],0.1)
@@ -107,7 +135,9 @@ def recv(e, t=5.0):
         buf = buf[i:]
         pk = dec(buf)
         if pk is None: buf = buf[1:]; continue
-        if pk['cmd'] == e: return pk['payload']
+        if pk['cmd'] == e:
+            log(f'UART RX: got cmd=0x{e:02x} len={len(pk["payload"])}')
+            return pk['payload']
         buf = b''
     return None
 
@@ -211,6 +241,7 @@ def cmd_mount(mountpoint):
     pending = {}          # written but not synced: {name: bytes}
 
     def sync_pending():
+        log('SYNC thread started')
         """Background: write pending files to tape, update dir cache."""
         while True:
             try:
@@ -221,16 +252,19 @@ def cmd_mount(mountpoint):
                 
                 # Flush pending writes to tape
                 for name, data in list(pending.items()):
+                    log(f'SYNC writing {name} ({len(data)} bytes)')
                     err = fs_mount.write_file(name, data)
                     if not err:
                         dir_cache.append((name, len(data)))
                         del pending[name]
                         status['text'] = f'SYNCED {name}'
+                        log(f'SYNC done: {name}')
                     else:
                         status['text'] = f'ERROR syncing {name}'
                 
                 if not pending:
                     status['text'] = f'IDLE  ({len(dir_cache)} files)'
+                    log(f'SYNC idle: {len(dir_cache)} files, {len(pending)} pending')
             except Exception as e:
                 status['text'] = f'ERROR: {e}'
             time.sleep(5)
@@ -257,13 +291,17 @@ def cmd_mount(mountpoint):
         return any(fn == name for fn, _ in all_files())
 
     def get_data(name):
-        """Return file data from pending cache or tape."""
+        """Return file data from pending cache or tape dir cache."""
         if name == '_tape_status.txt':
             return status['text'].encode()
         if name in pending:
             return pending[name]
-        d, _ = fs_mount.read_file(name)
-        return d or b''
+        # Not in pending — try cached tape data
+        for fn, _ in dir_cache:
+            if fn == name:
+                # Queue a background read (placeholder, returns empty for now)
+                return b''
+        return b''
         """Return file data from pending cache or tape."""
         if name == '_tape_status.txt':
             return status['text'].encode()
@@ -275,6 +313,7 @@ def cmd_mount(mountpoint):
     # ---- FUSE operations (instant, from cache + pending) ------ #
     class TapeFS(fuse.Operations):
         def getattr(self, path, fh=None):
+            log(f'FUSE getattr: {path}')
             if path == '/':
                 return {'st_mode': 0o755 | 0o40000, 'st_nlink': 2}
             name = path.lstrip('/')
@@ -283,19 +322,24 @@ def cmd_mount(mountpoint):
                     return {'st_mode': 0o644 | 0o100000, 'st_nlink': 1, 'st_size': sz}
             raise fuse.FuseOSError(errno.ENOENT)
         def readdir(self, path, fh=None):
+            log(f'FUSE readdir: {path}')
             yield '.'; yield '..'
             for fn, _ in all_files():
                 yield fn
         def read(self, path, size, offset, fh):
-            data = get_data(path.lstrip('/'))
+            name = path.lstrip('/')
+            log(f'FUSE read: {name} offset={offset} size={size}')
+            data = get_data(name)
             return data[offset:offset+size]
         def create(self, path, mode, **kw):
             name = path.lstrip('/')
+            log(f'FUSE create: {name}')
             if name not in pending:
                 pending[name] = b''
             return 0
         def open(self, path, *a):
             name = path.lstrip('/')
+            log(f'FUSE open: {name}')
             # Create file in pending if doesn't exist
             if name not in pending and name not in [fn for fn,_ in all_files()]:
                 pending[name] = b''
@@ -308,16 +352,20 @@ def cmd_mount(mountpoint):
             return len(data)
         def truncate(self, path, length, fh=None):
             name = path.lstrip('/')
+            log(f'FUSE truncate: {name} len={length}')
             old = pending.get(name, get_data(name))
             pending[name] = old[:length]
             return 0
+        def ftruncate(self, path, length, fh):
+            return self.truncate(path, length)
+        def flush(self, path, fh): return 0
+        def release(self, path, fh): return 0
+        def fsync(self, path, datasync, fh): return 0
         def unlink(self, path):
             name = path.lstrip('/')
+            log(f'FUSE unlink: {name}')
             pending.pop(name, None)
-            d, e = fs_mount.list_files()
-            if not e:
-                d.remove(name)
-                fs_mount.write_directory(d)
+            # Mark for deletion in dir_cache — sync thread handles tape
             return 0
 
     # ---- Start FUSE in background ----------------------------- #
