@@ -206,7 +206,7 @@ def cmd_ls():
 
 def cmd_read(name, out=None):
     from tapefs import Filesystem, RawBlock
-    fs_mount = Filesystem(wb, lambda: RawBlock(bytes=rb_fast()) if rb_fast() else None, lambda n: sk_fast(n))
+    fs_mount = Filesystem(wb, lambda: (lambda r: RawBlock(bytes=r) if r else None)(rb_fast()), lambda n: sk_fast(n))
     data, err = fs_mount.read_file(name)
     if err: return print(f"  '{name}' not found")
     if out:
@@ -219,7 +219,7 @@ def cmd_write(local, tapename=None):
     tapename = tapename or os.path.basename(local)
     with open(local, 'rb') as f: data = f.read()
     from tapefs import Filesystem, RawBlock
-    fs_mount = Filesystem(wb, lambda: RawBlock(bytes=rb_fast()) if rb_fast() else None, lambda n: sk_fast(n))
+    fs_mount = Filesystem(wb, lambda: (lambda r: RawBlock(bytes=r) if r else None)(rb_fast()), lambda n: sk_fast(n))
     err = fs_mount.write_file(tapename, data)
     if err: return print(f"  Write failed: {err}")
     print(f"  Wrote '{tapename}' ({len(data)} B)")
@@ -233,7 +233,7 @@ def cmd_mount(mountpoint):
     fw_start()
     print("  Setting up filesystem...", flush=True)
     from tapefs import Filesystem, RawBlock, Directory
-    fs_mount = Filesystem(wb, lambda: RawBlock(bytes=rb_fast()) if rb_fast() else None, lambda n: sk_fast(n))
+    fs_mount = Filesystem(wb, lambda: (lambda r: RawBlock(bytes=r) if r else None)(rb_fast()), lambda n: sk_fast(n))
 
     # ---- Status + directory cache + pending writes ------------ #
     status = {'text': 'LOADING...'}
@@ -312,14 +312,19 @@ def cmd_mount(mountpoint):
 
     # ---- FUSE operations (instant, from cache + pending) ------ #
     class TapeFS(fuse.Operations):
+        def access(self, path, amode):
+            log(f'FUSE access: {path} mode={amode}')
+            return 0
         def getattr(self, path, fh=None):
             log(f'FUSE getattr: {path}')
             if path == '/':
-                return {'st_mode': 0o755 | 0o40000, 'st_nlink': 2}
+                return {'st_mode': 0o755 | 0o40000, 'st_nlink': 2,
+                        'st_uid': os.getuid(), 'st_gid': os.getgid()}
             name = path.lstrip('/')
             for fn, sz in all_files():
                 if fn == name:
-                    return {'st_mode': 0o644 | 0o100000, 'st_nlink': 1, 'st_size': sz}
+                    return {'st_mode': 0o644 | 0o100000, 'st_nlink': 1,
+                            'st_size': sz, 'st_uid': os.getuid(), 'st_gid': os.getgid()}
             raise fuse.FuseOSError(errno.ENOENT)
         def readdir(self, path, fh=None):
             log(f'FUSE readdir: {path}')
@@ -331,20 +336,21 @@ def cmd_mount(mountpoint):
             log(f'FUSE read: {name} offset={offset} size={size}')
             data = get_data(name)
             return data[offset:offset+size]
-        def create(self, path, mode, **kw):
+        def create(self, path, mode):
             name = path.lstrip('/')
             log(f'FUSE create: {name}')
             if name not in pending:
                 pending[name] = b''
-            return 0
-        def open(self, path, *a):
+            return hash(name) & 0xFFFFFFFF
+        def open(self, path, flags):
             name = path.lstrip('/')
             log(f'FUSE open: {name}')
-            # Create file in pending if doesn't exist
-            if name not in pending and name not in [fn for fn,_ in all_files()]:
+            if not exists(name):
                 pending[name] = b''
-            return 0
+            return hash(name) & 0xFFFFFFFF
+        def write(self, path, data, offset, fh):
             name = path.lstrip('/')
+            log(f'FUSE write: {name} offset={offset} size={len(data)}')
             if name == '_tape_status.txt': return len(data)
             old = pending.get(name, get_data(name))
             new = old[:offset] + data + old[offset+len(data):]

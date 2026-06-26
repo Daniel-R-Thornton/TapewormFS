@@ -129,7 +129,7 @@ void dacWrite(int value) {
     dacOutput.push_back(sample);
     if (!dacOutputFile.empty()) {
         static FILE* f = nullptr;
-        if (!f) f = fopen(dacOutputFile.c_str(), "wb");
+        if (!f) f = fopen(dacOutputFile.c_str(), "ab");
         if (f) fwrite(&sample, sizeof(float), 1, f);
     }
 }
@@ -139,7 +139,7 @@ void dacWriteFloat(float sample) {
     dacOutput.push_back(sample);
     if (!dacOutputFile.empty()) {
         static FILE* f = nullptr;
-        if (!f) f = fopen(dacOutputFile.c_str(), "wb");
+        if (!f) f = fopen(dacOutputFile.c_str(), "ab");
         if (f) fwrite(&sample, sizeof(float), 1, f);
     }
 }
