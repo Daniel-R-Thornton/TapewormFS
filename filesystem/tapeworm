@@ -364,8 +364,8 @@ def cmd_mount(mountpoint):
         def redraw():
             cw = wave_canvas.winfo_width() or 800
             ch = wave_canvas.winfo_height() or 200
-            wave_canvas.delete('all')
             mid = ch/2
+            wave_canvas.delete('all')
             for y in range(0,ch,20):
                 wave_canvas.create_line(0,y,cw,y,fill='#1a3a5c',width=1)
             wave_canvas.create_line(0,mid,cw,mid,fill='#2a4a6c',width=1)
@@ -394,11 +394,25 @@ def cmd_mount(mountpoint):
                 pos_lbl.config(text=f"POS: {pos_mm:.0f} mm")
             except: pass
             
-            # Motor state
-            pkt_lbl.config(text=f"PACKETS: {status['text']}")
-            motor_states = ["■ STOPPED", "▶▶ FAST", "▶ PLAY", "◀◀ REW"]
-            ms = motor_states[int(time.time())%4]
-            motor_lbl.config(text=f"MOTOR: {ms}")
+            # Status from real background sync
+            txt = status.get('text', 'LOADING...')
+            pkt_lbl.config(text=f"{txt}")
+            
+            # Motor state from status
+            if 'SYNC' in txt or 'WRIT' in txt:
+                motor_lbl.config(text='MOTOR: ▶▶ FAST', fg=ACCENT)
+            elif 'IDLE' in txt:
+                motor_lbl.config(text='MOTOR: ■ STOPPED', fg='#ff6b6b')
+            elif 'LOAD' in txt or 'SCAN' in txt:
+                motor_lbl.config(text='MOTOR: ◀◀ REW', fg='#ffaa00')
+            else:
+                motor_lbl.config(text=f'MOTOR: {txt}', fg='#888')
+            
+            # File count
+            n_tape = len(dir_cache)
+            n_pend = len(pending)
+            if n_pend:
+                pkt_lbl.config(text=f"WRITING ({n_pend} pending, {n_tape} on tape)")
             
             root.after(100, redraw)
         
