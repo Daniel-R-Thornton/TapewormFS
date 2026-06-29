@@ -64,7 +64,7 @@ compile_commands.json
 
 # Node / Vite
 node_modules/
-dist/
+/dist/
 
 # Debug / diagnostic files (created during RS codec debugging)
 src/rs_*.c
