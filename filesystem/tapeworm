@@ -301,17 +301,12 @@ def cmd_mount(mountpoint):
         return any(fn == name for fn, _ in all_files())
 
     def get_data(name):
-        """Return file data from pending cache or tape dir cache."""
+        """Read file from tape (slow but real)."""
         if name == '_tape_status.txt':
             return status['text'].encode()
-        if name in pending:
-            return pending[name]
-        # Not in pending — try cached tape data
-        for fn, _ in dir_cache:
-            if fn == name:
-                # Queue a background read (placeholder, returns empty for now)
-                return b''
-        return b''
+        # Direct tape read — no cache
+        d, _ = fs_mount.read_file(name)
+        return d or b''
         """Return file data from pending cache or tape."""
         if name == '_tape_status.txt':
             return status['text'].encode()
@@ -362,7 +357,8 @@ def cmd_mount(mountpoint):
             name = path.lstrip('/')
             log(f'FUSE write: {name} offset={offset} size={len(data)}')
             if name == '_tape_status.txt': return len(data)
-            old = pending.get(name, get_data(name))
+            # Read existing from tape, or start fresh
+            old = get_data(name) or b''
             new = old[:offset] + data + old[offset+len(data):]
             pending[name] = new
             return len(data)
