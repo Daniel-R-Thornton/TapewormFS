@@ -429,13 +429,17 @@ def cmd_mount(mountpoint):
         
         # Waveform reader
         def read_wave(path, count=1600):
-            """Read the last N float32 samples from a live waveform file."""
+            """Read float32 samples from a WAV file (last N samples)."""
             if not os.path.exists(path): return []
             try:
                 with open(path, 'rb') as f:
                     f.seek(0, 2)
                     sz = f.tell()
-                    n = min(count, sz // 4)
+                    if sz < 44: return []  # too small for WAV header
+                    # Data starts at byte 44 (standard WAV header size for float32)
+                    data_start = 44
+                    data_bytes = sz - data_start
+                    n = min(count, data_bytes // 4)
                     if n < 10: return []
                     f.seek(-n*4, 2)
                     raw = f.read(n*4)
@@ -452,7 +456,7 @@ def cmd_mount(mountpoint):
                 wave_canvas.create_line(0,y,cw,y,fill='#1a3a5c',width=1)
             wave_canvas.create_line(0,mid,cw,mid,fill='#2a4a6c',width=1)
             
-            samples = read_wave("/tmp/tapewormfs_live.raw")
+            samples = read_wave("/tmp/tapewormfs_live.wav")
             log(f'WAVE: {len(samples)} samples')
             if len(samples)>100:
                 display = samples[-400:]
@@ -473,8 +477,8 @@ def cmd_mount(mountpoint):
             tw = tape_canvas.winfo_width() or 800
             tape_canvas.delete('all')
             try:
-                sz = os.path.getsize("/tmp/tapewormfs_raw.tape")
-                pos_mm = sz/4/(3200/47.6) if sz else 0
+                sz = os.path.getsize("/tmp/tapewormfs_live.wav") if os.path.exists("/tmp/tapewormfs_live.wav") else 0
+                pos_mm = max(0, sz - 44) / 4 / (3200/47.6) if sz > 44 else 0
                 frac = min(1.0, pos_mm/90000)
                 hx = int(frac*(tw-10))+5
                 tape_canvas.create_line(5,15,tw-5,15,fill='#333',width=6)
@@ -488,8 +492,9 @@ def cmd_mount(mountpoint):
             pkt_lbl.config(text=f"{txt}")
             
             # Direction — half-duplex, either TX or RX
-            live_sz = os.path.getsize("/tmp/tapewormfs_live.raw") if os.path.exists("/tmp/tapewormfs_live.raw") else 0
-            tape_sz = os.path.getsize("/tmp/tapewormfs_raw.tape") if os.path.exists("/tmp/tapewormfs_raw.tape") else 0
+            live_sz = os.path.getsize("/tmp/tapewormfs_live.wav") if os.path.exists("/tmp/tapewormfs_live.wav") else 0
+            # Position from live WAV (exclude 44-byte header)
+            pos_mm = max(0, live_sz - 44) / 4 / (3200/47.6) if live_sz > 44 else 0
             
             # Motor state from status
             if 'SYNC' in txt or 'WRIT' in txt:

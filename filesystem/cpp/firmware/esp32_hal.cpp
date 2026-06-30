@@ -123,16 +123,29 @@ static std::vector<float> dacOutput;
 static std::string dacOutputFile;
 
 // ---- Single live waveform buffer (half-duplex) ---------------- #
-// The modem is either encoding (TX) or decoding (RX), never both.
-// A single file shows whatever is currently happening.
+// Writes 32-bit float WAV — playable in any audio player.
+// Sample rate: 3200 Hz, mono, float32.
 
 static void writeLiveSample(float s) {
     static FILE* f = nullptr;
     if (!f) {
-        f = fopen("/tmp/tapewormfs_live.raw", "wb");
-        if (f) setbuf(f, NULL);  // unbuffered
+        f = fopen("/tmp/tapewormfs_live.wav", "wb");
+        if (f) {
+            // Write WAV header (dummy sizes, updated on close or ignored)
+            unsigned char hdr[44] = {
+                'R','I','F','F', 0,0,0,0,  'W','A','V','E',
+                'f','m','t',' ', 16,0,0,0,  3,0, 1,0,  // PCM float, mono
+                0x0C,0x00,0x00,0x00,  // 3200 Hz sample rate
+                0x0C,0x00,0x00,0x00,  // byte rate (unused for float)
+                4,0, 32,0,  // block align, bits per sample
+                'd','a','t','a', 0,0,0,0  // data chunk size placeholder
+            };
+            // Set sample rate to 3200
+            hdr[24] = 0x80; hdr[25] = 0x0C;  // 3200 little-endian
+            fwrite(hdr, 1, 44, f);
+        }
     }
-    if (f) { fwrite(&s, sizeof(float), 1, f); }
+    if (f) { fwrite(&s, sizeof(float), 1, f); fflush(f); }
 }
 
 // ---- I2C / DAC --------------------------------------------------- #
