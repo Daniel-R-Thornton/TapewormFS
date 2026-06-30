@@ -44,7 +44,7 @@ private:
 
     std::vector<float> buf_;
     int sps_ = 64;
-    int guard_ = 6;
+    int guard_ = 0;  // encoder doesn't use guard between symbols
 
     std::vector<int> symbols_;
     int consecutiveZeros_ = 0;

@@ -15,8 +15,11 @@ float ModemEncoder::pilotSample() {
 }
 
 float ModemEncoder::toneSample(double freqHz) {
+    // Reset phase each time frequency changes — decoder expects clean symbols
     static double tonePhase = 0;
-    if (freqHz <= 0) { tonePhase = 0; return 0; }
+    static double lastFreq = 0;
+    if (freqHz <= 0) { tonePhase = 0; lastFreq = 0; return 0; }
+    if (freqHz != lastFreq) { tonePhase = 0; lastFreq = freqHz; }
     float v = std::sin(2.0 * M_PI * tonePhase);
     tonePhase += freqHz / cfg_.sampleRate;
     if (tonePhase >= 1.0) tonePhase -= 1.0;
@@ -31,8 +34,7 @@ void ModemEncoder::advancePhase() {
 
 void ModemEncoder::startEncoding(const std::vector<uint8_t>& data) {
     sps_ = cfg_.sampleRate / cfg_.symbolsPerSec;
-    guard_ = sps_ / 10;
-    if (guard_ < 2) guard_ = 2;
+    guard_ = 0;  // no guard
 
     phase_ = Phase::kLeader;
     samplesInPhase_ = 0;
@@ -41,10 +43,8 @@ void ModemEncoder::startEncoding(const std::vector<uint8_t>& data) {
 
     symbols_.clear();
     for (auto byte : data) {
-        int hi = (byte >> 5) & 0x07;
-        int lo = byte & 0x07;
+        int hi = (byte >> 5) & 0x07;  // top 3 bits = one symbol
         symbols_.push_back(hi);
-        symbols_.push_back(lo);
     }
 }
 
@@ -73,7 +73,7 @@ bool ModemEncoder::generateSample() {
             samplesInPhase_ = 0;
             symbolIndex_++;
             if (symbolIndex_ >= (int)symbols_.size()) {
-                phase_ = Phase::kGuard;
+                phase_ = Phase::kDone;
                 samplesInPhase_ = 0;
             }
         }
