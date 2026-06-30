@@ -105,7 +105,7 @@ void ModemDecoder::feedSample(float sample) {
         }
 
         for (int t = 0; t < 4; t++) {
-            bitCollector_.push_back(energies[t] > noiseFloor_[t] * 2.0 ? 1 : 0);
+            bitCollector_.push_back(energies[t] > noiseFloor_[t] * 1.2 ? 1 : 0);
             bitsCollected_++;
         }
 
