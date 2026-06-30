@@ -122,11 +122,28 @@ float adcReadFloat(int pin) {
 static std::vector<float> dacOutput;
 static std::string dacOutputFile;
 
+// ---- Single live waveform buffer (half-duplex) ---------------- #
+// The modem is either encoding (TX) or decoding (RX), never both.
+// A single file shows whatever is currently happening.
+
+static void writeLiveSample(float s) {
+    static FILE* f = nullptr;
+    if (!f) {
+        f = fopen("/tmp/tapewormfs_live.raw", "wb");
+        if (f) setbuf(f, NULL);  // unbuffered
+    }
+    if (f) { fwrite(&s, sizeof(float), 1, f); }
+}
+
+// ---- I2C / DAC --------------------------------------------------- #
+
+
 void i2cInit(const I2cConfig&) {}
 
 void dacWrite(int value) {
     float sample = (value / 2047.5f) - 1.0f;
     dacOutput.push_back(sample);
+    writeLiveSample(sample);
     if (!dacOutputFile.empty()) {
         static FILE* f = nullptr;
         if (!f) f = fopen(dacOutputFile.c_str(), "ab");
@@ -137,6 +154,7 @@ void dacWrite(int value) {
 void dacWriteFloat(float sample) {
     sample = std::clamp(sample, -1.0f, 1.0f);
     dacOutput.push_back(sample);
+    writeLiveSample(sample);
     if (!dacOutputFile.empty()) {
         static FILE* f = nullptr;
         if (!f) f = fopen(dacOutputFile.c_str(), "ab");

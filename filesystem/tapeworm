@@ -428,23 +428,18 @@ def cmd_mount(mountpoint):
         pos_lbl.pack(side=tk.RIGHT, padx=10)
         
         # Waveform reader
-        def read_wave():
-            """Read audio samples from the tape file."""
-            path = "/tmp/tapewormfs_raw.tape"
+        def read_wave(path, count=1600):
+            """Read the last N float32 samples from a live waveform file."""
             if not os.path.exists(path): return []
             try:
-                sz = os.path.getsize(path)
-                n = sz // 4
-                if n < 100: return []
-                # Read last ~500ms of audio (1600 samples at 3200 Hz)
-                # Skip the final guard silence — look for signal
-                count = min(1600, n)
                 with open(path, 'rb') as f:
-                    f.seek(-count*4, 2)
-                    raw = f.read(count*4)
-                samples = [__import__('struct').unpack_from('<f',raw,i)[0] for i in range(0,len(raw),4)]
-                # Find the last peak in the window
-                return samples
+                    f.seek(0, 2)
+                    sz = f.tell()
+                    n = min(count, sz // 4)
+                    if n < 10: return []
+                    f.seek(-n*4, 2)
+                    raw = f.read(n*4)
+                return [__import__('struct').unpack_from('<f',raw,i)[0] for i in range(0,len(raw),4)]
             except:
                 return []
         
@@ -457,7 +452,7 @@ def cmd_mount(mountpoint):
                 wave_canvas.create_line(0,y,cw,y,fill='#1a3a5c',width=1)
             wave_canvas.create_line(0,mid,cw,mid,fill='#2a4a6c',width=1)
             
-            samples = read_wave()
+            samples = read_wave("/tmp/tapewormfs_live.raw")
             log(f'WAVE: {len(samples)} samples')
             if len(samples)>100:
                 # Use last 400 samples for display (skip initial tail)
@@ -488,15 +483,19 @@ def cmd_mount(mountpoint):
             txt = status.get('text', 'LOADING...')
             pkt_lbl.config(text=f"{txt}")
             
+            # Direction — half-duplex, either TX or RX
+            live_sz = os.path.getsize("/tmp/tapewormfs_live.raw") if os.path.exists("/tmp/tapewormfs_live.raw") else 0
+            tape_sz = os.path.getsize("/tmp/tapewormfs_raw.tape") if os.path.exists("/tmp/tapewormfs_raw.tape") else 0
+            
             # Motor state from status
             if 'SYNC' in txt or 'WRIT' in txt:
-                motor_lbl.config(text='MOTOR: ▶▶ FAST', fg=ACCENT)
-            elif 'IDLE' in txt:
-                motor_lbl.config(text='MOTOR: ■ STOPPED', fg='#ff6b6b')
+                motor_lbl.config(text='⏺ REC  TX  ▶▶', fg='#ff4444')
             elif 'LOAD' in txt or 'SCAN' in txt:
-                motor_lbl.config(text='MOTOR: ◀◀ REW', fg='#ffaa00')
+                motor_lbl.config(text='⏹ PLAY RX  ▶▶', fg=ACCENT)
+            elif 'IDLE' in txt:
+                motor_lbl.config(text='⏸ IDLE', fg='#ff6b6b')
             else:
-                motor_lbl.config(text=f'MOTOR: {txt}', fg='#888')
+                motor_lbl.config(text=f'{txt}', fg='#888')
             
             # File count
             n_tape = len(dir_cache)
