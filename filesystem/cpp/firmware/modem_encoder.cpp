@@ -1,11 +1,12 @@
 #include "modem_encoder.hpp"
 #include "esp32_hal.hpp"
-#include <cmath>
-#include <cstring>
 
 namespace tapefs { namespace firmware {
 
-static constexpr double kTones[8] = {400, 600, 800, 1000, 1150, 1300, 1450, 1550};
+void ModemEncoder::advancePhase() {
+    phase_ = static_cast<Phase>(static_cast<int>(phase_) + 1);
+    samplesInPhase_ = 0;
+}
 
 float ModemEncoder::pilotSample() {
     float v = std::sin(2.0 * M_PI * pilotPhase_) * cfg_.pilotAmplitude;
@@ -14,37 +15,26 @@ float ModemEncoder::pilotSample() {
     return v;
 }
 
-float ModemEncoder::toneSample(double freqHz) {
-    // Reset phase each time frequency changes — decoder expects clean symbols
-    static double tonePhase = 0;
-    static double lastFreq = 0;
-    if (freqHz <= 0) { tonePhase = 0; lastFreq = 0; return 0; }
-    if (freqHz != lastFreq) { tonePhase = 0; lastFreq = freqHz; }
-    float v = std::sin(2.0 * M_PI * tonePhase);
-    tonePhase += freqHz / cfg_.sampleRate;
-    if (tonePhase >= 1.0) tonePhase -= 1.0;
-    return v;
-}
-
-void ModemEncoder::advancePhase() {
-    Phase next = static_cast<Phase>(static_cast<int>(phase_) + 1);
-    phase_ = next;
-    samplesInPhase_ = 0;
+float ModemEncoder::toneSample(double freqHz, double phase) {
+    return std::sin(2.0 * M_PI * phase);
 }
 
 void ModemEncoder::startEncoding(const std::vector<uint8_t>& data) {
-    sps_ = cfg_.sampleRate / cfg_.symbolsPerSec;
-    guard_ = 0;  // no guard
+    sps_ = cfg_.sampleRate / cfg_.symbolsPerSec;  // 128
+    bitsPerFrame_ = cfg_.bitsPerFrame;              // 4
 
     phase_ = Phase::kLeader;
     samplesInPhase_ = 0;
     pilotPhase_ = 0;
     symbolIndex_ = 0;
+    bitPos_ = 0;
 
-    symbols_.clear();
+    // Convert bytes to bitstream (MSB first)
+    bitstream_.clear();
     for (auto byte : data) {
-        int hi = (byte >> 5) & 0x07;  // top 3 bits = one symbol
-        symbols_.push_back(hi);
+        for (int b = 7; b >= 0; b--) {
+            bitstream_.push_back((byte >> b) & 1);
+        }
     }
 }
 
@@ -53,37 +43,47 @@ bool ModemEncoder::generateSample() {
 
     switch (phase_) {
     case Phase::kLeader:
-        // Just pilot tone for 1 second
+        // Just pilot for 0.5 seconds
         samplesInPhase_++;
-        if (samplesInPhase_ >= cfg_.sampleRate) advancePhase();
+        if (samplesInPhase_ >= cfg_.sampleRate / 2) advancePhase();
         break;
 
     case Phase::kSync:
-        output += toneSample(kTones[0]); // sync = tone 0
+        // Sync frame: ALL tones ON (known pattern) + pilot
+        if (samplesInPhase_ < sps_) {
+            for (int t = 0; t < bitsPerFrame_; t++) {
+                double phase = kTones[t] * samplesInPhase_ / cfg_.sampleRate;
+                output += toneSample(kTones[t], phase);
+            }
+        }
         samplesInPhase_++;
-        if (samplesInPhase_ >= sps_ * cfg_.syncSymbols) advancePhase();
+        if (samplesInPhase_ >= sps_ * cfg_.syncSymbols) {
+            symbolIndex_ = 0;
+            advancePhase();
+        }
         break;
 
-    case Phase::kData:
-        if (symbolIndex_ < (int)symbols_.size()) {
-            output += toneSample(kTones[symbols_[symbolIndex_] & 0x07]);
+    case Phase::kData: {
+        if (bitPos_ >= (int)bitstream_.size()) {
+            advancePhase();
+            break;
+        }
+        // Build one frame: mix tones for the next 4 bits
+        if (samplesInPhase_ < sps_) {
+            for (int t = 0; t < bitsPerFrame_ && (bitPos_ + t) < (int)bitstream_.size(); t++) {
+                if (bitstream_[bitPos_ + t]) {
+                    double phase = kTones[t] * samplesInPhase_ / cfg_.sampleRate;
+                    output += toneSample(kTones[t], phase);
+                }
+            }
         }
         samplesInPhase_++;
         if (samplesInPhase_ >= sps_) {
             samplesInPhase_ = 0;
-            symbolIndex_++;
-            if (symbolIndex_ >= (int)symbols_.size()) {
-                phase_ = Phase::kDone;
-                samplesInPhase_ = 0;
-            }
+            bitPos_ += bitsPerFrame_;
         }
         break;
-
-    case Phase::kGuard:
-        // Just pilot
-        samplesInPhase_++;
-        if (samplesInPhase_ >= guard_) advancePhase();
-        break;
+    }
 
     case Phase::kDone:
         if (onDone_) onDone_();

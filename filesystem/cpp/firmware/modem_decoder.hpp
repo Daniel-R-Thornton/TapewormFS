@@ -1,11 +1,11 @@
 #pragma once
 /**
- * ModemDecoder — FSK decoder driven by timer ISR.
+ * ModemDecoder — Multi-tone decoder with adaptive noise floor.
  *
- * Real ESP32 usage:
- *   decoder.startDecoding();
- *   // timer ISR at 3200 Hz: decoder.feedSample(hal::adcReadFloat())
- *   // when frameReady(), take the data
+ * Each symbol window contains 4 frequencies mixed together.
+ * Energy at each frequency → compare to noise floor → bit decision.
+ * 4 bits per frame → pack into bytes.
+ * Adaptive noise floor tracks the background level.
  */
 
 #include <cstdint>
@@ -16,44 +16,45 @@ namespace tapefs { namespace firmware {
 
 class ModemDecoder {
 public:
-    ModemDecoder() : ModemDecoder(Config{}) {}
     using FrameCallback = std::function<void(const std::vector<uint8_t>&)>;
 
     struct Config {
-        int    sampleRate    = 3200;
-        int    symbolsPerSec = 50;
-        double pilotFreqHz   = 62.5;
+        int sampleRate     = 3200;
+        int symbolsPerSec  = 25;
+        int bitsPerFrame   = 4;
     };
 
+    static constexpr double kTones[4] = {500, 700, 900, 1100};
+
+    ModemDecoder() : ModemDecoder(Config{}) {}
     explicit ModemDecoder(Config cfg) : cfg_(cfg) {}
 
-    /// Start listening for frames.
     void startDecoding();
-
-    /// Call from timer ISR: feed one ADC sample.
     void feedSample(float sample);
-
     bool isFrameReady() const { return frameReady_; }
     std::vector<uint8_t> takeFrame();
-
     void onFrame(FrameCallback cb) { onFrame_ = std::move(cb); }
 
 private:
     Config cfg_;
     FrameCallback onFrame_;
+    int sps_ = 128;
 
     std::vector<float> buf_;
-    int sps_ = 64;
-    int guard_ = 0;  // encoder doesn't use guard between symbols
-
-    std::vector<int> symbols_;
-    int consecutiveZeros_ = 0;
     bool inFrame_ = false;
-    int dataSymbols_ = 0;
     bool frameReady_ = false;
     std::vector<uint8_t> frameData_;
 
-    int detectTone(const float* samples, int n);
+    int consecutiveSync_ = 0;
+    int frameSkip_ = 0;  // frames to skip after sync
+    std::vector<uint8_t> bitCollector_;
+    int bitsCollected_ = 0;
+
+    // Adaptive noise floor (per frequency band)
+    double noiseFloor_[4] = {0, 0, 0, 0};
+    int noiseCount_ = 0;
+
+    double detectEnergy(const float* samples, int n, int toneIdx);
     void emitFrame();
     void reset();
 };
