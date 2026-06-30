@@ -429,12 +429,24 @@ def cmd_mount(mountpoint):
         
         # Waveform reader
         def read_wave():
-            if os.path.exists("/tmp/tapewormfs_raw.tape"):
-                with open("/tmp/tapewormfs_raw.tape",'rb') as f:
-                    f.seek(-320*4,2)
-                    raw = f.read(320*4)
-                return [__import__('struct').unpack_from('<f',raw,i)[0] for i in range(0,len(raw),4)]
-            return []
+            """Read audio samples from the tape file."""
+            path = "/tmp/tapewormfs_raw.tape"
+            if not os.path.exists(path): return []
+            try:
+                sz = os.path.getsize(path)
+                n = sz // 4
+                if n < 100: return []
+                # Read last ~500ms of audio (1600 samples at 3200 Hz)
+                # Skip the final guard silence — look for signal
+                count = min(1600, n)
+                with open(path, 'rb') as f:
+                    f.seek(-count*4, 2)
+                    raw = f.read(count*4)
+                samples = [__import__('struct').unpack_from('<f',raw,i)[0] for i in range(0,len(raw),4)]
+                # Find the last peak in the window
+                return samples
+            except:
+                return []
         
         def redraw():
             cw = wave_canvas.winfo_width() or 800
@@ -447,12 +459,14 @@ def cmd_mount(mountpoint):
             
             samples = read_wave()
             log(f'WAVE: {len(samples)} samples')
-            if len(samples)>1:
-                step = max(1, len(samples)//cw)
+            if len(samples)>100:
+                # Use last 400 samples for display (skip initial tail)
+                display = samples[-400:]
+                step = max(1, len(display)//cw)
                 pts = []
                 for x in range(cw):
-                    idx = min(x*step, len(samples)-1)
-                    y = mid - samples[idx]*(ch/2-5)
+                    idx = min(x*step, len(display)-1)
+                    y = mid - display[idx]*(ch/2-5)
                     pts.extend([x, max(0,min(ch-1,y))])
                 if pts: wave_canvas.create_line(*pts, fill=ACCENT, width=2, smooth=True)
             
