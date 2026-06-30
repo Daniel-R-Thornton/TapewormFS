@@ -455,15 +455,19 @@ def cmd_mount(mountpoint):
             samples = read_wave("/tmp/tapewormfs_live.raw")
             log(f'WAVE: {len(samples)} samples')
             if len(samples)>100:
-                # Use last 400 samples for display (skip initial tail)
                 display = samples[-400:]
+                # Auto-scale: find peak and normalize to fill canvas
+                peak = max(abs(s) for s in display) or 1.0
+                scale = (ch/2 - 10) / peak
                 step = max(1, len(display)//cw)
                 pts = []
                 for x in range(cw):
                     idx = min(x*step, len(display)-1)
-                    y = mid - display[idx]*(ch/2-5)
+                    y = mid - display[idx] * scale
                     pts.extend([x, max(0,min(ch-1,y))])
                 if pts: wave_canvas.create_line(*pts, fill=ACCENT, width=2, smooth=True)
+                # Show peak value
+                wave_canvas.create_text(cw-10, 10, text=f"pk={peak:.3f}", fill='#666', anchor='ne', font=('Consolas',8))
             
             # Tape bar
             tw = tape_canvas.winfo_width() or 800
