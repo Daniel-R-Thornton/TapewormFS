@@ -251,16 +251,15 @@ def cmd_mount(mountpoint):
         """Background: write pending files to tape, update dir cache."""
         while True:
             try:
-                # Read current tape directory
-                d, err = fs_mount.list_files()
-                if not err:
-                    dir_cache[:] = [(x.filename, x.file_size) for x in d.entries]
-                
-                # Flush pending writes to tape
+                # Flush pending writes — no directory read needed
+                # (modem decoder can't read tape reliably yet)
                 for name, data in list(pending.items()):
                     log(f'SYNC writing {name} ({len(data)} bytes)')
-                    err = fs_mount.write_file(name, data)
-                    if not err:
+                    # Write a raw data block directly (bypass filesystem)
+                    from tapefs import Block, BlockType, serialise
+                    blk = Block(type=BlockType.DATA, seq_no=len(dir_cache)+1, data=data)
+                    raw = serialise(blk)
+                    if wb(raw.bytes):
                         dir_cache.append((name, len(data)))
                         del pending[name]
                         status['text'] = f'SYNCED {name}'
