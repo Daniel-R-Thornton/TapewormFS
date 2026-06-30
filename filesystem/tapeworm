@@ -454,8 +454,11 @@ def cmd_mount(mountpoint):
                 wave_canvas.create_line(0,y,cw,y,fill='#1a3a5c',width=1)
             wave_canvas.create_line(0,mid,cw,mid,fill='#2a4a6c',width=1)
             
-            samples = read_wave("/tmp/tapewormfs_live.wav")
-            log(f'WAVE: {len(samples)} samples')
+            try:
+                samples = read_wave("/tmp/tapewormfs_live.wav")
+                log(f'WAVE: {len(samples)} samples')
+            except:
+                samples = []
             if len(samples)>100:
                 display = samples[-400:]
                 # Auto-scale: find peak and normalize to fill canvas
